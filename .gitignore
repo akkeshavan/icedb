@@ -1,0 +1,77 @@
+# ============================================================
+# Rust
+# ============================================================
+target/
+**/*.rs.bk
+*.pdb
+
+# Cargo lock files — keep root and tests workspace locks,
+# ignore locks in nested sub-crates/drivers
+drivers/rust/target/
+drivers/python/target/
+drivers/nodejs/target/
+
+# ============================================================
+# Node.js / npm / pnpm / yarn (admin-ui + nodejs driver)
+# ============================================================
+node_modules/
+dist/
+.cache/
+*.tsbuildinfo
+
+# Build output from NAPI-RS (native .node binaries)
+drivers/nodejs/*.node
+drivers/nodejs/npm/
+
+# ============================================================
+# Python (PyO3 / Maturin driver)
+# ============================================================
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+drivers/python/.venv/
+drivers/python/dist/
+drivers/python/*.egg-info/
+drivers/python/target/
+
+# ============================================================
+# Database data directories (runtime state, not source)
+# ============================================================
+data/
+bookstore-data/
+*.wal
+*.heap
+*.btree
+*.acl
+sequences/
+acls/
+
+# ============================================================
+# Editor / IDE
+# ============================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ============================================================
+# Environment / secrets
+# ============================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# ============================================================
+# Misc
+# ============================================================
+*.log
+*.tmp
+*.bak
+/tmp/

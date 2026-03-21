@@ -1,0 +1,297 @@
+/// Tests for information_schema/pg_catalog virtual views, COPY FROM/TO, and PREPARE/EXECUTE.
+use tempfile::TempDir;
+use crate::common::{make_engine, exec, exec_err};
+use sql::Value;
+
+// ── information_schema.tables ─────────────────────────────────────────────────
+
+#[test]
+fn test_information_schema_tables() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE catalog_test (id INT)");
+    let result = exec(&engine, "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'");
+    assert!(
+        result.rows.iter().any(|r| r.get("table_name") == Some(&Value::Text("catalog_test".to_string()))),
+        "Expected catalog_test in information_schema.tables, got: {:?}",
+        result.rows
+    );
+}
+
+#[test]
+fn test_information_schema_tables_type() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE type_test (id INT)");
+    let result = exec(&engine, "SELECT table_type FROM information_schema.tables WHERE table_name = 'type_test'");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].get("table_type"), Some(&Value::Text("BASE TABLE".to_string())));
+}
+
+// ── information_schema.columns ────────────────────────────────────────────────
+
+#[test]
+fn test_information_schema_columns() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE cols_test (id INT, name TEXT)");
+    let result = exec(&engine, "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'cols_test'");
+    assert_eq!(result.rows.len(), 2, "Expected 2 columns, got: {:?}", result.rows);
+    // Verify column names are present
+    let col_names: Vec<Option<&Value>> = result.rows.iter().map(|r| r.get("column_name")).collect();
+    assert!(col_names.contains(&Some(&Value::Text("id".to_string()))));
+    assert!(col_names.contains(&Some(&Value::Text("name".to_string()))));
+}
+
+#[test]
+fn test_information_schema_columns_ordinal() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE ordinal_test (a INT, b INT, c TEXT)");
+    let result = exec(&engine, "SELECT column_name, ordinal_position FROM information_schema.columns WHERE table_name = 'ordinal_test' ORDER BY ordinal_position");
+    assert_eq!(result.rows.len(), 3);
+    assert_eq!(result.rows[0].get("ordinal_position"), Some(&Value::Int4(1)));
+    assert_eq!(result.rows[1].get("ordinal_position"), Some(&Value::Int4(2)));
+    assert_eq!(result.rows[2].get("ordinal_position"), Some(&Value::Int4(3)));
+}
+
+// ── information_schema.schemata ───────────────────────────────────────────────
+
+#[test]
+fn test_information_schema_schemata() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    let result = exec(&engine, "SELECT schema_name FROM information_schema.schemata");
+    let names: Vec<Option<&Value>> = result.rows.iter().map(|r| r.get("schema_name")).collect();
+    assert!(names.contains(&Some(&Value::Text("public".to_string()))));
+}
+
+// ── pg_catalog.pg_tables ──────────────────────────────────────────────────────
+
+#[test]
+fn test_pg_catalog_pg_tables() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE pgtables_test (id INT)");
+    let result = exec(&engine, "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public'");
+    assert!(
+        result.rows.iter().any(|r| r.get("tablename") == Some(&Value::Text("pgtables_test".to_string()))),
+        "Expected pgtables_test in pg_catalog.pg_tables, got: {:?}",
+        result.rows
+    );
+}
+
+#[test]
+fn test_pg_tables_without_schema_prefix() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE pg_test_tbl (id INT)");
+    // pg_tables without schema prefix should also work
+    let result = exec(&engine, "SELECT tablename FROM pg_tables WHERE schemaname = 'public'");
+    assert!(
+        result.rows.iter().any(|r| r.get("tablename") == Some(&Value::Text("pg_test_tbl".to_string()))),
+        "Expected pg_test_tbl in pg_tables, got: {:?}",
+        result.rows
+    );
+}
+
+// ── pg_catalog.pg_namespace ───────────────────────────────────────────────────
+
+#[test]
+fn test_pg_catalog_pg_namespace() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    let result = exec(&engine, "SELECT nspname FROM pg_catalog.pg_namespace");
+    let names: Vec<Option<&Value>> = result.rows.iter().map(|r| r.get("nspname")).collect();
+    assert!(names.contains(&Some(&Value::Text("public".to_string()))));
+    assert!(names.contains(&Some(&Value::Text("pg_catalog".to_string()))));
+}
+
+// ── pg_catalog.pg_type ────────────────────────────────────────────────────────
+
+#[test]
+fn test_pg_catalog_pg_type() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    let result = exec(&engine, "SELECT typname FROM pg_catalog.pg_type");
+    let type_names: Vec<Option<&Value>> = result.rows.iter().map(|r| r.get("typname")).collect();
+    assert!(type_names.contains(&Some(&Value::Text("text".to_string()))));
+    assert!(type_names.contains(&Some(&Value::Text("int4".to_string()))));
+    assert!(type_names.contains(&Some(&Value::Text("bool".to_string()))));
+}
+
+// ── pg_catalog.pg_roles ───────────────────────────────────────────────────────
+
+#[test]
+fn test_pg_catalog_pg_roles() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE ROLE test_role_view LOGIN");
+    let result = exec(&engine, "SELECT rolname, rolcanlogin FROM pg_catalog.pg_roles");
+    assert!(
+        result.rows.iter().any(|r| r.get("rolname") == Some(&Value::Text("test_role_view".to_string()))),
+        "Expected test_role_view in pg_roles, got: {:?}",
+        result.rows
+    );
+}
+
+// ── pg_catalog.pg_class ───────────────────────────────────────────────────────
+
+#[test]
+fn test_pg_catalog_pg_class() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE pgclass_test (id INT)");
+    let result = exec(&engine, "SELECT relname FROM pg_catalog.pg_class WHERE relkind = 'r'");
+    assert!(
+        result.rows.iter().any(|r| r.get("relname") == Some(&Value::Text("pgclass_test".to_string()))),
+        "Expected pgclass_test in pg_class, got: {:?}",
+        result.rows
+    );
+}
+
+// ── pg_catalog.pg_attribute ───────────────────────────────────────────────────
+
+#[test]
+fn test_pg_catalog_pg_attribute() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE pgattr_test (id INT, name TEXT)");
+    let result = exec(&engine, "SELECT attname FROM pg_catalog.pg_attribute WHERE attisdropped = false");
+    let names: Vec<Option<&Value>> = result.rows.iter().map(|r| r.get("attname")).collect();
+    assert!(names.contains(&Some(&Value::Text("id".to_string()))));
+    assert!(names.contains(&Some(&Value::Text("name".to_string()))));
+}
+
+// ── COPY TO / COPY FROM ───────────────────────────────────────────────────────
+
+#[test]
+fn test_copy_to_csv() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE copy_test (id INT, name TEXT)");
+    exec(&engine, "INSERT INTO copy_test VALUES (1, 'Alice'), (2, 'Bob')");
+    let tmp = std::env::temp_dir().join("icedb_copy_test.csv");
+    exec(&engine, &format!("COPY copy_test TO '{}' (FORMAT CSV, HEADER true)", tmp.display()));
+    let content = std::fs::read_to_string(&tmp).unwrap();
+    assert!(content.contains("Alice"), "CSV should contain Alice: {}", content);
+    assert!(content.contains("Bob"), "CSV should contain Bob: {}", content);
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn test_copy_from_csv() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE copy_in (id INT, name TEXT)");
+    let tmp = std::env::temp_dir().join("icedb_copy_in.csv");
+    std::fs::write(&tmp, "id,name\n1,Alice\n2,Bob\n").unwrap();
+    exec(&engine, &format!("COPY copy_in FROM '{}' (FORMAT CSV, HEADER true)", tmp.display()));
+    let result = exec(&engine, "SELECT COUNT(*) FROM copy_in");
+    let count = match result.rows.first().and_then(|r| r.get_by_idx(0)) {
+        Some(Value::Int8(n)) => *n,
+        Some(Value::Int4(n)) => *n as i64,
+        other => panic!("Expected count, got {:?}", other),
+    };
+    assert_eq!(count, 2, "Expected 2 rows after COPY FROM");
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn test_copy_roundtrip() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE copy_roundtrip (id INT, val TEXT)");
+    exec(&engine, "INSERT INTO copy_roundtrip VALUES (10, 'hello'), (20, 'world')");
+
+    let tmp = std::env::temp_dir().join("icedb_roundtrip.csv");
+    exec(&engine, &format!("COPY copy_roundtrip TO '{}' (FORMAT CSV, HEADER true)", tmp.display()));
+
+    exec(&engine, "CREATE TABLE copy_roundtrip2 (id INT, val TEXT)");
+    exec(&engine, &format!("COPY copy_roundtrip2 FROM '{}' (FORMAT CSV, HEADER true)", tmp.display()));
+
+    let result = exec(&engine, "SELECT id, val FROM copy_roundtrip2 ORDER BY id");
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows[0].get("id"), Some(&Value::Int4(10)));
+    assert_eq!(result.rows[1].get("id"), Some(&Value::Int4(20)));
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// ── PREPARE / EXECUTE / DEALLOCATE ───────────────────────────────────────────
+
+#[test]
+fn test_prepare_execute_basic() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE prep_test (id INT, val TEXT)");
+    exec(&engine, "INSERT INTO prep_test VALUES (1, 'one'), (2, 'two'), (3, 'three')");
+
+    exec(&engine, "PREPARE myq AS SELECT val FROM prep_test WHERE id = $1");
+    let result = exec(&engine, "EXECUTE myq(1)");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].get("val"), Some(&Value::Text("one".to_string())));
+}
+
+#[test]
+fn test_prepare_execute_multiple_params() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE prep_multi (id INT, val TEXT)");
+    exec(&engine, "INSERT INTO prep_multi VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+
+    exec(&engine, "PREPARE range_q AS SELECT id, val FROM prep_multi WHERE id >= $1 AND id <= $2");
+    let result = exec(&engine, "EXECUTE range_q(1, 2)");
+    assert_eq!(result.rows.len(), 2);
+}
+
+#[test]
+fn test_prepare_execute_reuse() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE prep_reuse (id INT, val TEXT)");
+    exec(&engine, "INSERT INTO prep_reuse VALUES (1, 'first'), (2, 'second')");
+
+    exec(&engine, "PREPARE lookup AS SELECT val FROM prep_reuse WHERE id = $1");
+
+    let r1 = exec(&engine, "EXECUTE lookup(1)");
+    assert_eq!(r1.rows.len(), 1);
+    assert_eq!(r1.rows[0].get("val"), Some(&Value::Text("first".to_string())));
+
+    let r2 = exec(&engine, "EXECUTE lookup(2)");
+    assert_eq!(r2.rows.len(), 1);
+    assert_eq!(r2.rows[0].get("val"), Some(&Value::Text("second".to_string())));
+}
+
+#[test]
+fn test_deallocate() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE dealloc_test (id INT)");
+    exec(&engine, "INSERT INTO dealloc_test VALUES (1)");
+
+    exec(&engine, "PREPARE stmtname AS SELECT id FROM dealloc_test");
+    // Verify it works
+    let r = exec(&engine, "EXECUTE stmtname()");
+    assert_eq!(r.rows.len(), 1);
+
+    // Deallocate it
+    exec(&engine, "DEALLOCATE stmtname");
+
+    // Now executing should fail
+    let err = exec_err(&engine, "EXECUTE stmtname()");
+    let err_str = format!("{}", err);
+    assert!(err_str.contains("stmtname") || err_str.contains("does not exist"),
+        "Expected not-found error, got: {}", err_str);
+}
+
+#[test]
+fn test_deallocate_all() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE dealloc_all_test (id INT)");
+    exec(&engine, "PREPARE s1 AS SELECT id FROM dealloc_all_test");
+    exec(&engine, "PREPARE s2 AS SELECT id FROM dealloc_all_test");
+    exec(&engine, "DEALLOCATE ALL");
+    let err1 = exec_err(&engine, "EXECUTE s1()");
+    assert!(format!("{}", err1).contains("does not exist") || format!("{}", err1).contains("s1"));
+}

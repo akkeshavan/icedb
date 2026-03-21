@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/storage",
+    "crates/wal",
+    "crates/txn",
+    "crates/btree",
+    "crates/catalog",
+    "crates/sql",
+    "crates/network",
+    "crates/auth",
+    "crates/server",
+    "crates/cli",
+    "crates/admin-server",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+thiserror = "1"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+parking_lot = "0.12"

@@ -1,0 +1,24 @@
+[workspace]
+
+[package]
+name = "icedb-python"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "icedb"
+crate-type = ["cdylib"]
+
+[dependencies]
+storage = { path = "../../crates/storage" }
+wal = { path = "../../crates/wal" }
+txn = { path = "../../crates/txn" }
+catalog = { path = "../../crates/catalog" }
+sql = { path = "../../crates/sql" }
+pyo3 = { version = "0.22", features = ["extension-module"] }
+parking_lot = "0.12"
+thiserror = "1"
+
+[features]
+extension-module = ["pyo3/extension-module"]
+default = ["extension-module"]

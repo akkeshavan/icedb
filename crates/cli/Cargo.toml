@@ -1,0 +1,24 @@
+[package]
+name = "cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "nkv-psql"
+path = "src/main.rs"
+
+[dependencies]
+storage = { path = "../storage" }
+wal = { path = "../wal" }
+txn = { path = "../txn" }
+catalog = { path = "../catalog" }
+sql = { path = "../sql" }
+auth = { path = "../auth" }
+rustyline = "14"
+tabled = "0.16"
+thiserror = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

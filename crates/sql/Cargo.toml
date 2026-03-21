@@ -1,0 +1,21 @@
+[package]
+name = "sql"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+storage = { path = "../storage" }
+wal = { path = "../wal" }
+txn = { path = "../txn" }
+btree = { path = "../btree" }
+catalog = { path = "../catalog" }
+sqlparser = { version = "0.53", features = ["visitor"] }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+log = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+tokio = { workspace = true }
+
+[dev-dependencies]
+env_logger = { workspace = true }
+tempfile = "3"

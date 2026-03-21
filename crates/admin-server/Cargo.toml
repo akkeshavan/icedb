@@ -1,0 +1,26 @@
+[package]
+name = "admin-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "icedb-admin"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Internal icedb crates
+storage = { path = "../storage" }
+wal = { path = "../wal" }
+txn = { path = "../txn" }
+catalog = { path = "../catalog" }
+sql = { path = "../sql" }
+auth = { path = "../auth" }

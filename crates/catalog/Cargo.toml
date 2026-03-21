@@ -1,0 +1,19 @@
+[package]
+name = "catalog"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+storage = { path = "../storage" }
+wal = { path = "../wal" }
+txn = { path = "../txn" }
+btree = { path = "../btree" }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+
+[dev-dependencies]
+env_logger = { workspace = true }
+tempfile = "3"
