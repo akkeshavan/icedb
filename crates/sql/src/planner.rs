@@ -101,6 +101,13 @@ impl Planner {
                 ..
             } => match object_type {
                 ast::ObjectType::Table => self.plan_drop_table(names, *if_exists),
+                ast::ObjectType::Database => {
+                    let name = names.first()
+                        .and_then(|n| n.0.last())
+                        .map(|i| i.value.clone())
+                        .unwrap_or_default();
+                    Ok(LogicalPlan::DropDatabase { name, if_exists: *if_exists })
+                }
                 _ => Err(SqlError::NotImplemented(format!("DROP {:?}", object_type))),
             },
             Statement::CreateRole {
@@ -171,6 +178,12 @@ impl Planner {
             | Statement::ShowCreate { .. }
             | Statement::ShowTables { .. } => {
                 Ok(LogicalPlan::NoOp { command: "SHOW".to_string() })
+            }
+            Statement::CreateDatabase { db_name, if_not_exists, .. } => {
+                let name = db_name.0.last()
+                    .map(|i| i.value.clone())
+                    .unwrap_or_default();
+                Ok(LogicalPlan::CreateDatabase { name, if_not_exists: *if_not_exists })
             }
             Statement::CreateSchema { schema_name, if_not_exists, .. } => {
                 let name = match schema_name {

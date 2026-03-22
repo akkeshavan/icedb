@@ -20,6 +20,8 @@ pub struct QueryEngine {
     pub txn_manager: Arc<TransactionManager>,
     pub catalog: Arc<CatalogManager>,
     pub data_dir: PathBuf,
+    /// Name of the database this engine serves.
+    pub db_name: String,
     /// The role executing queries (None = superuser/bootstrap mode, allow all)
     pub current_role: Option<String>,
     /// Prepared statement cache: name → original SQL string
@@ -38,10 +40,20 @@ impl QueryEngine {
         catalog: Arc<CatalogManager>,
         data_dir: PathBuf,
     ) -> Self {
+        Self::new_with_db(txn_manager, catalog, data_dir, "icedb".to_string())
+    }
+
+    pub fn new_with_db(
+        txn_manager: Arc<TransactionManager>,
+        catalog: Arc<CatalogManager>,
+        data_dir: PathBuf,
+        db_name: String,
+    ) -> Self {
         Self {
             txn_manager,
             catalog,
             data_dir,
+            db_name,
             current_role: None,
             prepared_statements: Mutex::new(HashMap::new()),
             open_sessions: Mutex::new(HashMap::new()),
@@ -168,6 +180,7 @@ impl QueryEngine {
         let ctx = Arc::new(ExecutionContext {
             xid,
             data_dir: self.data_dir.clone(),
+            db_name: self.db_name.clone(),
             txn_manager: Arc::clone(&self.txn_manager),
             catalog: Arc::clone(&self.catalog),
         });

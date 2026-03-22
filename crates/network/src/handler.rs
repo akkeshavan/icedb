@@ -20,7 +20,7 @@ use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
 use auth::Authenticator;
 use catalog::DataType;
-use sql::engine::QueryEngine;
+use sql::db_manager::DatabaseManager;
 use sql::executor::ExecutionResult;
 use sql::value::Value;
 
@@ -41,7 +41,7 @@ impl QueryParser for IceDbQueryParser {
 // ── Main handler ──────────────────────────────────────────────────────────────
 
 pub struct IceDbHandler {
-    pub engine: Arc<QueryEngine>,
+    pub db_manager: Arc<DatabaseManager>,
     pub authenticator: Arc<Authenticator>,
     query_parser: Arc<IceDbQueryParser>,
     /// Unique ID for this connection, used to track multi-statement transactions.
@@ -49,9 +49,9 @@ pub struct IceDbHandler {
 }
 
 impl IceDbHandler {
-    pub fn new(engine: Arc<QueryEngine>, authenticator: Arc<Authenticator>) -> Self {
+    pub fn new(db_manager: Arc<DatabaseManager>, authenticator: Arc<Authenticator>) -> Self {
         Self {
-            engine,
+            db_manager,
             authenticator,
             query_parser: Arc::new(IceDbQueryParser),
             session_id: new_session_id(),
@@ -67,8 +67,11 @@ fn new_session_id() -> String {
 
 impl Drop for IceDbHandler {
     fn drop(&mut self) {
-        // Abort any open transaction when the connection is dropped without COMMIT/ROLLBACK.
-        self.engine.abort_session(&self.session_id);
+        // Best-effort abort: try the default engine. Per-db sessions will be
+        // cleaned up when the engine is dropped.
+        if let Ok(engine) = self.db_manager.get_or_open("icedb") {
+            engine.abort_session(&self.session_id);
+        }
     }
 }
 
@@ -253,7 +256,7 @@ fn execution_result_to_responses(result: ExecutionResult) -> Vec<Response<'stati
 impl SimpleQueryHandler for IceDbHandler {
     async fn do_query<'a, C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         query: &'a str,
     ) -> PgWireResult<Vec<Response<'a>>>
     where
@@ -261,7 +264,15 @@ impl SimpleQueryHandler for IceDbHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let results = self.engine.execute_session_multi(&self.session_id, query).map_err(|e| {
+        let db_name = client.metadata().get("database").map(|s| s.as_str()).unwrap_or("icedb");
+        let engine = self.db_manager.get_or_open(db_name).map_err(|e| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_owned(),
+                "3D000".to_owned(),
+                e.to_string(),
+            )))
+        })?;
+        let results = engine.execute_session_multi(&self.session_id, query).map_err(|e| {
             let sqlstate = e.sqlstate().to_owned();
             PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
@@ -337,7 +348,12 @@ impl ExtendedQueryHandler for IceDbHandler {
     {
         // Execute with substituted params to get schema, then return field info
         let sql = substitute_params(&portal.statement.statement, &portal.parameters);
-        let result = self.engine.execute(&sql).map_err(|e| {
+        let engine = self.db_manager.get_or_open("icedb").map_err(|e| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_owned(), "3D000".to_owned(), e.to_string(),
+            )))
+        })?;
+        let result = engine.execute(&sql).map_err(|e| {
             let sqlstate = e.sqlstate().to_owned();
             PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
@@ -368,7 +384,12 @@ impl ExtendedQueryHandler for IceDbHandler {
     {
         let sql = substitute_params(&portal.statement.statement, &portal.parameters);
 
-        let result = self.engine.execute(&sql).map_err(|e| {
+        let engine = self.db_manager.get_or_open("icedb").map_err(|e| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_owned(), "3D000".to_owned(), e.to_string(),
+            )))
+        })?;
+        let result = engine.execute(&sql).map_err(|e| {
             let sqlstate = e.sqlstate().to_owned();
             PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
@@ -402,7 +423,7 @@ impl ExtendedQueryHandler for IceDbHandler {
 // ── Handler factory ───────────────────────────────────────────────────────────
 
 pub struct IceDbHandlerFactory {
-    pub engine: Arc<QueryEngine>,
+    pub db_manager: Arc<DatabaseManager>,
     pub authenticator: Arc<Authenticator>,
     pub startup_handler: Arc<IceDbStartupHandler>,
 }
@@ -414,12 +435,11 @@ impl PgWireHandlerFactory for IceDbHandlerFactory {
     type CopyHandler = NoopCopyHandler;
 
     fn simple_query_handler(&self) -> Arc<Self::SimpleQueryHandler> {
-        // Create a fresh handler per connection (pgwire calls this once per connection)
-        Arc::new(IceDbHandler::new(self.engine.clone(), self.authenticator.clone()))
+        Arc::new(IceDbHandler::new(self.db_manager.clone(), self.authenticator.clone()))
     }
 
     fn extended_query_handler(&self) -> Arc<Self::ExtendedQueryHandler> {
-        Arc::new(IceDbHandler::new(self.engine.clone(), self.authenticator.clone()))
+        Arc::new(IceDbHandler::new(self.db_manager.clone(), self.authenticator.clone()))
     }
 
     fn startup_handler(&self) -> Arc<Self::StartupHandler> {

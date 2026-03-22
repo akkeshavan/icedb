@@ -29,7 +29,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let txn_manager = Arc::new(txn::TransactionManager::new(Arc::clone(&wal_writer)));
+    let txn_manager = Arc::new(txn::TransactionManager::new_with_wal_recovery(Arc::clone(&wal_writer), &data_dir));
     let catalog = match catalog::CatalogManager::open(
         &data_dir,
         Arc::clone(&wal_writer),
@@ -44,10 +44,13 @@ fn main() {
     let engine = Arc::new(sql::QueryEngine::new(
         Arc::clone(&txn_manager),
         Arc::clone(&catalog),
-        data_dir,
+        data_dir.clone(),
     ));
 
-    let repl = Repl::new(engine, catalog, config);
+    let db_manager = Arc::new(sql::DatabaseManager::new(data_dir));
+    db_manager.register_engine("icedb", Arc::clone(&engine));
+
+    let mut repl = Repl::new(db_manager, engine, catalog, config);
     if let Err(e) = repl.run() {
         eprintln!("Error: {}", e);
         std::process::exit(1);

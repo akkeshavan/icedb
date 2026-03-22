@@ -6,8 +6,8 @@ This chapter documents every SQL feature supported by icedb. Use it as a referen
 
 **In this chapter:**
 - Data types (BOOLEAN, INT, BIGINT, FLOAT, TEXT, VARCHAR, BYTEA, DATE, TIMESTAMP, NUMERIC, UUID)
-- Type casting (including Text → numeric, Infinity, NaN, boolean strings)
-- DDL: CREATE TABLE (with PRIMARY KEY and UNIQUE), DROP TABLE, ALTER TABLE, CREATE INDEX, CREATE ROLE
+- Type casting (including Text-to-numeric, Infinity, NaN, boolean strings)
+- DDL: CREATE TABLE (with PRIMARY KEY, UNIQUE, CHECK, FK), DROP TABLE, ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE), CREATE INDEX, CREATE ROLE, CREATE DATABASE, DROP DATABASE, CREATE SCHEMA
 - DML: INSERT, UPDATE, DELETE (with RETURNING), INSERT ON CONFLICT (UPSERT)
 - Queries: SELECT, WHERE, ORDER BY, LIMIT / OFFSET / FETCH FIRST, GROUP BY, JOINs (INNER/LEFT/RIGHT/FULL/CROSS/LATERAL), subqueries (correlated), CTEs (WITH RECURSIVE), window functions, set operations
 - Conditional expressions: CASE WHEN, COALESCE, NULLIF
@@ -178,7 +178,7 @@ icedb supports implicit and explicit casts between numeric types:
 | FLOAT8 | INT4 | truncating toward zero |
 | FLOAT8 | INT8 | truncating toward zero |
 | any | TEXT | formats as string |
-| BOOL | INT4 | true → 1, false → 0 |
+| BOOL | INT4 | true => 1, false => 0 |
 | TEXT | INT4 | parses decimal string; error if invalid |
 | TEXT | INT8 | parses decimal string; error if invalid |
 | TEXT | FLOAT8 | parses decimal string; `'Infinity'`, `'-Infinity'`, `'NaN'` are accepted |
@@ -332,6 +332,92 @@ CREATE ROLE role_name WITH LOGIN SUPERUSER PASSWORD 'adminpass';
 ```
 
 Creates a new role in `pg_authid`. The password is stored as a SCRAM-SHA-256 verifier (never plaintext). See Chapter 7 for details on the verifier format.
+
+### ALTER TABLE
+
+`ALTER TABLE` modifies an existing table's schema. Four operations are supported:
+
+**Add a column:**
+
+```sql
+ALTER TABLE products ADD COLUMN description TEXT;
+ALTER TABLE orders ADD COLUMN notes TEXT;
+```
+
+The new column is added to `pg_attribute`. Existing rows will return NULL for the new column until updated.
+
+**Drop a column:**
+
+```sql
+ALTER TABLE products DROP COLUMN description;
+```
+
+Removes the column from `pg_attribute`. The column data in existing heap pages is no longer visible.
+
+**Rename a column:**
+
+```sql
+ALTER TABLE products RENAME COLUMN name TO product_name;
+```
+
+Updates the column name in `pg_attribute`.
+
+**Rename a table:**
+
+```sql
+ALTER TABLE products RENAME TO items;
+```
+
+Updates the table name in `pg_class`. All indexes on the table continue to function.
+
+### CREATE DATABASE
+
+Creates a new database. Each database has its own heap files, catalog, and WAL in a subdirectory of the data directory.
+
+```sql
+CREATE DATABASE myapp;
+CREATE DATABASE IF NOT EXISTS analytics;
+```
+
+The new database is registered in `pg_database.json` (the database registry) in the data directory. Its data lives at `<data_dir>/databases/<dbname>/`. The special default database `icedb` continues to use `<data_dir>/` directly for backward compatibility.
+
+To switch to the new database from the CLI, use `\c`:
+
+```
+icedb=# CREATE DATABASE myapp;
+CREATE DATABASE
+icedb=# \c myapp
+You are now connected to database "myapp".
+myapp=# CREATE TABLE customers (id INT PRIMARY KEY, name TEXT);
+```
+
+Over a network connection (psql), specify the database in the connection string:
+
+```sh
+psql -h 127.0.0.1 -p 5432 -d myapp -U icedb
+```
+
+### DROP DATABASE
+
+Drops a database and removes its entry from the registry. The data directory for the database is **not** deleted from disk in this version (for safety).
+
+```sql
+DROP DATABASE myapp;
+DROP DATABASE IF EXISTS myapp;
+```
+
+The default database `icedb` cannot be dropped.
+
+### CREATE SCHEMA
+
+Creates a named schema within the current database.
+
+```sql
+CREATE SCHEMA reporting;
+CREATE SCHEMA reporting IF NOT EXISTS;
+```
+
+Currently, icedb uses schemas as a namespace in the catalog but all user tables are placed in `public` by default. Querying `pg_catalog.*` and `information_schema.*` tables uses the schema prefix.
 
 ---
 
@@ -1414,18 +1500,18 @@ NULL represents an absent or unknown value. Its behavior can be surprising if yo
 Any arithmetic or comparison expression that has a NULL operand yields NULL:
 
 ```
-NULL + 5       → NULL
-NULL * 0       → NULL   (not 0!)
-NULL = NULL    → NULL   (not TRUE)
-NULL <> NULL   → NULL   (not FALSE)
-NULL = 'foo'   → NULL
+NULL + 5       => NULL
+NULL * 0       => NULL   (not 0!)
+NULL = NULL    => NULL   (not TRUE)
+NULL <> NULL   => NULL   (not FALSE)
+NULL = 'foo'   => NULL
 ```
 
 In a WHERE clause, only rows where the condition evaluates to TRUE are returned. A NULL condition is treated as "not TRUE", so those rows are silently excluded:
 
 ```sql
 -- This returns zero rows even if some prices ARE 9.99
--- because NULL = 9.99 → NULL, which is not TRUE
+-- because NULL = 9.99 evaluates to NULL, which is not TRUE
 SELECT * FROM products WHERE price = NULL;
 ```
 
@@ -1564,7 +1650,9 @@ icedb returns standard five-character SQLSTATE codes on all errors. These match 
 | `42P01` | `undefined_table` | Table name not found in the catalog |
 | `42702` | `ambiguous_column` | Column name matches more than one table in scope |
 | `23502` | `not_null_violation` | NOT NULL constraint violation |
+| `23000` | `integrity_constraint_violation` | UNIQUE, PRIMARY KEY, or CHECK constraint violated |
 | `40001` | `serialization_failure` | Serializable transaction aborted due to conflict (SSI) |
+| `3D000` | `invalid_catalog_name` | Database name in connection request does not exist |
 | `57014` | `query_canceled` | Query canceled by the client |
 | `XX000` | `internal_error` | Unexpected internal error (should be reported as a bug) |
 
@@ -1597,7 +1685,10 @@ SELECT 10 / 0;
 The following features are **not yet implemented** in the current version. They are listed honestly so you can make an informed decision about whether icedb is appropriate for your use case. For a detailed explanation of *why* each item is missing and what is required to add it, see [Chapter 14 — Roadmap & Known Limitations](ch14-roadmap.md).
 
 **DDL:**
+- `ALTER TABLE` operations beyond ADD/DROP/RENAME COLUMN and RENAME TABLE (e.g., `ALTER COLUMN TYPE`, constraint changes, `SET DEFAULT`)
 - Column-level `GRANT`/`REVOKE` (only table-level privileges are supported)
+- Named indexes (`CREATE INDEX idx_name ON ...` — index name is ignored; derived from table OID and column)
+- `CREATE SEQUENCE` (use `SERIAL`/`BIGSERIAL` instead)
 - Table partitioning (`PARTITION BY RANGE/LIST/HASH`)
 - Tablespaces
 

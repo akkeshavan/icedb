@@ -1,6 +1,6 @@
 # IceDB Implementation Status
 
-**Last updated**: 2026-03-19
+**Last updated**: 2026-03-22
 **Total tests**: 968 passing, 4 ignored, 0 failing
 **Build**: `cargo build --workspace` — clean, zero warnings
 
@@ -125,8 +125,10 @@ All storage primitives implemented and tested.
 | FOREIGN KEY constraints | ✅ |
 | GRANT / REVOKE | ✅ |
 | VACUUM ANALYZE | ✅ |
+| CREATE DATABASE / DROP DATABASE | ✅ (pg_database.json registry; per-db data dirs) |
+| CREATE SCHEMA | ✅ (namespace registration; tables still placed in public) |
+| ALTER TABLE ADD/DROP/RENAME COLUMN, RENAME TABLE | ✅ |
 | UPSERT (ON CONFLICT DO UPDATE) | ❌ not implemented |
-| ALTER TABLE | ❌ not implemented |
 | Window functions (full — PARTITION BY, frame specs) | ⚠️ basic only |
 | NATURAL JOIN | ❌ not implemented |
 | ROLLUP / CUBE / GROUPING SETS | ❌ not implemented |
@@ -165,6 +167,8 @@ All storage primitives implemented and tested.
 | SQL keyword + table name auto-completion | ✅ |
 | ASCII table result rendering (`tabled`) | ✅ |
 | Meta-commands: `\d`, `\dt`, `\du`, `\l`, `\q`, `\i <file>`, `\e` | ✅ |
+| `\c [DBNAME]` / `\connect [DBNAME]` — switch active database | ✅ |
+| `\l` reads real `DatabaseRegistry` (pg_database.json) | ✅ |
 | `\timing` and `\x` (expanded output) | ✅ |
 | `\dump <path>` / `\restore <path>` — logical backup/restore | ✅ |
 | `.pgpass` file support | ❌ not implemented |
@@ -277,7 +281,7 @@ These were explicitly excluded because the feature doesn't exist in icedb yet:
 
 | Feature | PostgreSQL test file |
 |---------|---------------------|
-| `ALTER TABLE` | `alter_table.sql` |
+| `ALTER TABLE` advanced (type changes, constraint mods) | `alter_table.sql` |
 | Window functions (full frame specs, PARTITION BY) | `window.sql` |
 | FK constraint cascades | `foreign_key.sql` |
 | PL/pgSQL procedural language | `plpgsql.sql` |
@@ -294,6 +298,7 @@ These were explicitly excluded because the feature doesn't exist in icedb yet:
 
 ## Key architectural decisions made
 
+- **Multi-database support**: `DatabaseManager` (in `sql/src/db_manager.rs`) lazily creates/caches `Arc<QueryEngine>` per database. `DatabaseRegistry` persists database names in `{data_dir}/pg_database.json`. The default `icedb` database uses `data_dir/` directly for backward compatibility; all other databases live at `data_dir/databases/{name}/`. Network routing uses `client.metadata().get("database")` in `do_query`.
 - **SAVEPOINT partial rollback**: True page-level undo is not implemented. `ROLLBACK TO SAVEPOINT` aborts the entire transaction and starts a new one. Tests reflect this actual behaviour.
 - **SET TRANSACTION**: Accepted and parsed; treated as no-op (isolation level is set per-engine, not per-statement).
 - **`tests/` is a separate Cargo workspace**: `cargo test --workspace` from root only covers the 253 unit tests. Both workspaces must be run to get the full 968. See `tests/TEST-ARCHITECTURE.md`.
@@ -306,7 +311,7 @@ These were explicitly excluded because the feature doesn't exist in icedb yet:
 These are the gaps most likely to matter for a "production-ready" claim, roughly in priority order:
 
 1. **ON CONFLICT (UPSERT)** — blocked 2 integration tests; needed for practical use
-2. **ALTER TABLE** — essential for schema evolution, currently completely absent
+2. **ALTER TABLE** — basic operations (ADD/DROP/RENAME COLUMN, RENAME TABLE) implemented; advanced ops (type changes, constraint modifications) remain absent
 3. **OOM-safe buffer pool** — current implementation can grow without bound under load
 4. **Connection limit + graceful SIGTERM shutdown** — needed for production deployment
 5. **ANALYZE** — without it, `pg_statistic` histograms are never updated; cost-based optimizer degrades over time

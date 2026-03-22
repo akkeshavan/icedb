@@ -7,7 +7,7 @@ The `nkv-psql` CLI is icedb's interactive terminal. It provides a `rustyline`-ba
 - The prompt and multiline input
 - Command history and tab completion
 - Timing queries (`\timing`) and expanded output (`\x`)
-- Meta-commands reference (`\d`, `\dt`, `\du`, `\l`, `\?`)
+- Meta-commands reference (`\d`, `\dt`, `\du`, `\l`, `\c`, `\?`)
 - Output formatting and error handling
 
 ## Starting the CLI
@@ -32,8 +32,8 @@ The `--data-dir` flag specifies the data directory (default: `./data`). If the d
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--data-dir DIR` | | `./data` | Path to the icedb data directory |
-| `--user USER` | `-U` | `icedb` or `$PGUSER` | Username (currently informational; CLI runs as superuser) |
-| `--dbname DB` | `-d` | username or `$PGDATABASE` | Database name (currently informational) |
+| `--user USER` | `-U` | `icedb` or `$PGUSER` | Username |
+| `--dbname DB` | `-d` | `icedb` or `$PGDATABASE` | Database to open on startup; must exist in the data directory |
 | `--help` | `-h` | | Print usage and exit |
 
 ### Environment Variables
@@ -186,7 +186,9 @@ Meta-commands begin with a backslash (`\`). They are processed locally by the CL
 | `\dt` | List all tables in the `public` schema (same as `\d`) |
 | `\d tablename` | Describe the columns of `tablename` |
 | `\du` | List roles |
-| `\l` | List databases |
+| `\l` | List all databases |
+| `\c [DBNAME]` | Connect to a different database |
+| `\connect [DBNAME]` | Connect to a different database (alias for `\c`) |
 | `\timing` | Toggle query timing display |
 | `\x` | Toggle expanded (vertical) output |
 | `\dump path` | Write all table schemas and data to `path` as SQL statements |
@@ -233,12 +235,65 @@ icedb=# \du
 
 ### `\l` — List Databases
 
+Lists all databases registered in the data directory. The list is read from `pg_database.json` in the data directory.
+
 ```
 icedb=# \l
                                   List of databases
-   Name    |  Owner
------------+----------
- icedb     | icedb    
+   Name      |  Owner
+-------------+----------
+ icedb       | icedb
+ analytics   | icedb
+ staging     | icedb
+```
+
+The `icedb` database is always present — it is the default database created on first startup.
+
+### `\c` / `\connect` — Connect to a Different Database
+
+Switches the active database without restarting the CLI. After switching, the prompt updates to reflect the new database name.
+
+```
+icedb=# \c analytics
+You are now connected to database "analytics".
+analytics=# SELECT * FROM page_views LIMIT 5;
+```
+
+If the database does not exist, an error is printed and the current connection is unchanged:
+
+```
+icedb=# \c nonexistent
+ERROR: database "nonexistent" does not exist
+icedb=#
+```
+
+You can also use the long form:
+
+```
+icedb=# \connect staging
+You are now connected to database "staging".
+staging=#
+```
+
+**Typical workflow** when working with multiple databases:
+
+```
+-- Create a new database
+icedb=# CREATE DATABASE myapp;
+CREATE DATABASE
+
+-- Switch to it
+icedb=# \c myapp
+You are now connected to database "myapp".
+
+-- Create tables in the new database
+myapp=# CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT UNIQUE NOT NULL);
+CREATE TABLE
+
+-- Switch back
+myapp=# \c icedb
+You are now connected to database "icedb".
+icedb=#
 ```
 
 ### `\dump` — Dump Database to File
@@ -268,6 +323,10 @@ icedb=# \?
 General
   \q             quit nkv-psql
   \?             show this help
+
+Connection
+  \c [DBNAME]    connect to new database (default: current)
+  \connect       alias for \c
 
 Informational
   \d [NAME]      describe table, or list all tables

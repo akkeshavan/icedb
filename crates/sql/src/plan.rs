@@ -343,6 +343,16 @@ pub enum LogicalPlan {
     NoOp {
         command: String,
     },
+    /// CREATE DATABASE [IF NOT EXISTS] name
+    CreateDatabase {
+        name: String,
+        if_not_exists: bool,
+    },
+    /// DROP DATABASE [IF EXISTS] name
+    DropDatabase {
+        name: String,
+        if_exists: bool,
+    },
     /// CREATE SCHEMA [IF NOT EXISTS] name
     CreateSchema {
         name: String,

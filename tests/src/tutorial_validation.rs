@@ -149,7 +149,7 @@ fn test_tutorial_all_sql_examples() {
     ok(&engine, "SELECT a.name, b.title
         FROM authors a
         LEFT JOIN books b ON b.author_id = a.id
-        ORDER BY a.name");
+        ORDER BY a.name, b.title");
 
     // -----------------------------------------------------------------------
     // ch03: JOIN USING
@@ -278,13 +278,16 @@ fn test_tutorial_all_sql_examples() {
     ok(&engine, "SELECT name, COALESCE(country, 'Unknown') AS country FROM authors ORDER BY name");
 
     // -----------------------------------------------------------------------
-    // ch03: Advanced — ALTER TABLE ADD COLUMN, RENAME COLUMN
+    // ch03: Advanced — ALTER TABLE ADD COLUMN, RENAME COLUMN, DROP COLUMN, RENAME TABLE
     // -----------------------------------------------------------------------
     ok(&engine, "ALTER TABLE authors ADD COLUMN bio TEXT");
     ok(&engine, "UPDATE authors SET bio = 'Author of Middle-earth.' WHERE id = 1");
     ok(&engine, "SELECT id, name, bio FROM authors ORDER BY id");
     ok(&engine, "ALTER TABLE authors RENAME COLUMN bio TO biography");
     ok(&engine, "ALTER TABLE authors RENAME COLUMN biography TO bio");
+    ok(&engine, "ALTER TABLE authors DROP COLUMN bio");
+    ok(&engine, "ALTER TABLE authors RENAME TO writers");
+    ok(&engine, "ALTER TABLE writers RENAME TO authors"); // rename back
 
     // -----------------------------------------------------------------------
     // ch03: Advanced — PRIMARY KEY and UNIQUE constraints
@@ -639,7 +642,7 @@ fn test_tutorial_all_sql_examples() {
     ok(&engine, "SELECT a.name, b.title
         FROM authors a
         LEFT JOIN books b ON b.author_id = a.id
-        ORDER BY a.name");
+        ORDER BY a.name, b.title");
 
     // RIGHT JOIN
     ok(&engine, "SELECT a.name, b.title
@@ -917,4 +920,16 @@ fn test_tutorial_all_sql_examples() {
     exec_session(&engine, sid2, "BEGIN");
     exec_session(&engine, sid2, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
     exec_session(&engine, sid2, "COMMIT");
+
+    // -----------------------------------------------------------------------
+    // ch04: CREATE DATABASE / DROP DATABASE / CREATE SCHEMA
+    // -----------------------------------------------------------------------
+    ok(&engine, "CREATE DATABASE testdb_tut");
+    ok(&engine, "DROP DATABASE testdb_tut");
+    ok(&engine, "DROP DATABASE IF EXISTS testdb_tut");       // idempotent (already dropped)
+    ok(&engine, "CREATE DATABASE IF NOT EXISTS testdb_tut2");
+    ok(&engine, "CREATE DATABASE IF NOT EXISTS testdb_tut2"); // idempotent
+    ok(&engine, "DROP DATABASE IF EXISTS testdb_tut2");
+    ok(&engine, "CREATE SCHEMA reporting");
+    ok(&engine, "CREATE SCHEMA IF NOT EXISTS reporting");    // idempotent
 }

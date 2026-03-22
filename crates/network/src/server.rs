@@ -6,7 +6,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use auth::Authenticator;
-use sql::engine::QueryEngine;
+use sql::db_manager::DatabaseManager;
 
 use crate::handler::{IceDbHandlerFactory, IceDbStartupHandler};
 
@@ -14,7 +14,7 @@ use crate::handler::{IceDbHandlerFactory, IceDbStartupHandler};
 pub const DEFAULT_MAX_CONNECTIONS: usize = 100;
 
 pub struct Server {
-    pub engine: Arc<QueryEngine>,
+    pub db_manager: Arc<DatabaseManager>,
     pub authenticator: Arc<Authenticator>,
     pub bind_addr: SocketAddr,
     pub max_connections: usize,
@@ -23,12 +23,12 @@ pub struct Server {
 
 impl Server {
     pub fn new(
-        engine: Arc<QueryEngine>,
+        db_manager: Arc<DatabaseManager>,
         authenticator: Arc<Authenticator>,
         bind_addr: SocketAddr,
     ) -> Self {
         Self {
-            engine,
+            db_manager,
             authenticator,
             bind_addr,
             max_connections: DEFAULT_MAX_CONNECTIONS,
@@ -54,7 +54,7 @@ impl Server {
 
         let startup_handler = Arc::new(IceDbStartupHandler::new(Arc::clone(&self.authenticator)));
         let factory = Arc::new(IceDbHandlerFactory {
-            engine: self.engine,
+            db_manager: self.db_manager,
             authenticator: self.authenticator,
             startup_handler,
         });

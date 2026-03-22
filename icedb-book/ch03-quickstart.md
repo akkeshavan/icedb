@@ -13,6 +13,7 @@ This chapter walks you through starting icedb, connecting to it, and building a 
 - Updating and deleting rows
 - Advanced queries: CASE WHEN, string functions, ALTER TABLE, UNIQUE/PRIMARY KEY, window functions, WITH RECURSIVE
 - Production patterns: SERIAL, DEFAULT, FOREIGN KEY, CHECK, UPSERT, SAVEPOINT, GRANT
+- Managing multiple databases: CREATE DATABASE, DROP DATABASE, `\c`
 - What happens behind the scenes
 
 ## Starting the Server
@@ -20,7 +21,7 @@ This chapter walks you through starting icedb, connecting to it, and building a 
 Open a terminal. Create a directory to hold the database files and start the server:
 
 ```sh
-cargo run -p server --release -- --port 5432 --data-dir ./bookstore-data
+cargo run -p server --release -- --port 5432 --data-dir ./data
 ```
 
 The server prints:
@@ -38,7 +39,7 @@ On first startup, icedb bootstraps the system catalogs: it creates the heap file
 Open a second terminal and start the CLI:
 
 ```sh
-cargo run -p cli --release -- --data-dir ./bookstore-data
+cargo run -p cli --release -- --data-dir ./data
 ```
 
 The CLI (nkv-psql) runs the storage engine in-process against the data directory — no separate server process or TCP connection is needed. You will see:
@@ -47,13 +48,86 @@ The CLI (nkv-psql) runs the storage engine in-process against the data directory
 icedb=#
 ```
 
-The prompt format is `<dbname>=# ` for normal mode. When a statement spans multiple lines, the continuation prompt changes to `<dbname>-# ` to indicate that the engine is waiting for a semicolon to terminate the input.
+The prompt format is `<dbname>=# ` when the CLI is ready for a new statement. When you press Enter without a semicolon, the prompt changes to `<dbname>-# ` — this is the **continuation prompt**. It means the CLI is accumulating more input and waiting for a `;` before it sends anything to the engine. Type `;` (alone on a line if needed) to execute.
 
 You can also connect with a standard `psql` client to the server started above:
 
 ```sh
 psql -h 127.0.0.1 -p 5432 -U icedb
 ```
+
+> **Important — data directory must match.** The CLI and the server must point at the **same** `--data-dir`. If you start the server with `./data` but the CLI with `./mydb`, they see different files and each other's tables are invisible. Stick to one directory throughout this tutorial.
+
+## Creating a Database
+
+Every schema and table lives inside a database. icedb starts with a default database called `icedb`, but for this tutorial you will create a dedicated `bookstore` database to keep things clean and isolated.
+
+```sql
+CREATE DATABASE bookstore;
+```
+
+```
+CREATE DATABASE
+```
+
+Switch to it with `\c`:
+
+```
+icedb=# \c bookstore
+You are now connected to database "bookstore".
+bookstore=#
+```
+
+The prompt changes to `bookstore=#` — all subsequent statements run in this database. To confirm:
+
+```
+bookstore=# \l
+                                  List of databases
+   Name       |  Owner
+--------------+----------
+ bookstore    | icedb
+ icedb        | icedb
+```
+
+Everything you create from here on belongs to `bookstore`. Switching back to `icedb` later and running `\dt` would show an empty schema — the two databases are fully isolated.
+
+### Reconnecting after a restart
+
+Every time you restart the CLI or reconnect with psql you land on the default `icedb` database. You must switch to `bookstore` explicitly:
+
+```
+icedb=# \c bookstore
+You are now connected to database "bookstore".
+bookstore=#
+```
+
+Or skip the switch entirely by naming the database at startup:
+
+```sh
+# CLI — open bookstore directly
+cargo run -p cli --release -- --data-dir ./data --dbname bookstore
+
+# psql — connect straight to bookstore
+psql -h 127.0.0.1 -p 5432 -d bookstore -U icedb
+```
+
+If you connect to `./data` but see `\dt` showing nothing, you are either in the wrong database (run `\c bookstore`) or pointing at the wrong data directory.
+
+## A Note on Semicolons
+
+Every SQL statement must end with a semicolon (`;`). The CLI uses the semicolon as the signal to send the statement to the engine — until it sees one it keeps the prompt as `bookstore-#` and waits for more input.
+
+```
+bookstore=# SELECT 1
+bookstore-# ;
+ ?column?
+----------
+        1
+```
+
+The second line shows that `;` can be on its own line — just press Enter after it. If you see `bookstore-#` when you expected a result, type `;` and press Enter.
+
+**Paste tip:** only paste the SQL inside the `sql` code blocks. Do not include the expected-output lines (the ones with `---+---` separators and data rows) — the CLI will try to execute them as SQL and report a parse error.
 
 ## Creating Your First Tables
 
@@ -85,7 +159,7 @@ CREATE TABLE orders (
 Each `CREATE TABLE` statement returns `CREATE TABLE` with no rows affected. Verify the tables exist:
 
 ```
-icedb=# \dt
+bookstore=# \dt
  Schema |  Name   | Type
 --------+---------+-------
  public | authors | table
@@ -96,15 +170,15 @@ icedb=# \dt
 Inspect a table's columns:
 
 ```
-icedb=# \d books
+bookstore=# \d books
 Table "public.books"
-  Column    |  Type   | Nullable
-------------+---------+---------
- id         | int4    | not null
- title      | text    | not null
- author_id  | int4    | not null
+  Column    |  Type            | Nullable
+------------+------------------+---------
+ id         | int4             | not null
+ title      | text             | not null
+ author_id  | int4             | not null
  price      | double precision |
- published  | int4    |
+ published  | int4             |
 ```
 
 ## Inserting Rows
@@ -279,15 +353,15 @@ ORDER BY a.name, b.title;
 ```
 
 ```
-          title            |       author        | price
----------------------------+---------------------+-------
- Blood Meridian            | Cormac McCarthy     | 14.99
- Dune                      | Frank Herbert       | 15.99
- Children of Dune          | Frank Herbert       | 13.99
- The Hobbit                | J.R.R. Tolkien      | 12.99
- The Lord of the Rings     | J.R.R. Tolkien      | 24.99
- The Dispossessed          | Ursula K. Le Guin   | 11.99
- The Left Hand of Darkness | Ursula K. Le Guin   | 13.99
+ title                     | author            | price
+---------------------------+-------------------+-------
+ Blood Meridian            | Cormac McCarthy   | 14.99
+ Children of Dune          | Frank Herbert     | 13.99
+ Dune                      | Frank Herbert     | 15.99
+ The Hobbit                | J.R.R. Tolkien    | 12.99
+ The Lord of the Rings     | J.R.R. Tolkien    | 24.99
+ The Dispossessed          | Ursula K. Le Guin | 11.99
+ The Left Hand of Darkness | Ursula K. Le Guin | 13.99
 ```
 
 Find all orders with book title and total:
@@ -319,23 +393,23 @@ INSERT INTO authors VALUES (5, 'Gene Wolfe', 'United States');
 SELECT a.name, b.title
 FROM authors a
 LEFT JOIN books b ON b.author_id = a.id
-ORDER BY a.name;
+ORDER BY a.name, b.title;
 ```
 
 ```
         name         |          title
 ---------------------+--------------------------
  Cormac McCarthy     | Blood Meridian
- Frank Herbert       | Dune
  Frank Herbert       | Children of Dune
+ Frank Herbert       | Dune
  Gene Wolfe          | NULL
  J.R.R. Tolkien      | The Hobbit
  J.R.R. Tolkien      | The Lord of the Rings
- Ursula K. Le Guin   | The Left Hand of Darkness
  Ursula K. Le Guin   | The Dispossessed
+ Ursula K. Le Guin   | The Left Hand of Darkness
 ```
 
-Gene Wolfe appears with a NULL title because no books reference his author ID.
+Gene Wolfe appears with a NULL title because no books reference his author ID. NULLs sort last within each author group.
 
 ### JOIN USING
 
@@ -818,11 +892,19 @@ SELECT id, name, bio FROM authors ORDER BY id;
   5 | Gene Wolfe          | NULL
 ```
 
-You can also rename a column or the whole table:
+You can also rename or drop a column, or rename the whole table:
 
 ```sql
+-- Rename a column
 ALTER TABLE authors RENAME COLUMN bio TO biography;
 ALTER TABLE authors RENAME COLUMN biography TO bio;  -- rename it back
+
+-- Drop a column
+ALTER TABLE authors DROP COLUMN bio;
+
+-- Rename the table itself
+ALTER TABLE authors RENAME TO writers;
+ALTER TABLE writers RENAME TO authors;   -- rename it back
 ```
 
 ### Ensuring Uniqueness
@@ -1216,6 +1298,83 @@ UNLISTEN *;    -- stop listening on all channels
 ```
 
 Channel names are case-sensitive strings. The payload is optional — `NOTIFY channel_name` sends a bare notification with no payload.
+
+## Managing Multiple Databases
+
+You created the `bookstore` database at the start of this chapter. Here is the full picture of database management commands.
+
+### IF NOT EXISTS / IF EXISTS
+
+```sql
+-- Won't error if bookstore already exists
+CREATE DATABASE IF NOT EXISTS bookstore;
+
+-- Won't error if staging doesn't exist
+DROP DATABASE IF EXISTS staging;
+```
+
+### Database isolation
+
+Tables in one database are completely invisible from another. Try it:
+
+```
+bookstore=# \c icedb
+You are now connected to database "icedb".
+icedb=# \dt
+-- (empty — authors/books/orders live in bookstore, not icedb)
+icedb=# \c bookstore
+You are now connected to database "bookstore".
+bookstore=# \dt
+ Schema |  Name   | Type
+--------+---------+-------
+ public | authors | table
+ public | books   | table
+ public | orders  | table
+```
+
+### Connecting directly on startup
+
+Skip the `\c` step by naming the database when starting the CLI:
+
+```sh
+cargo run -p cli --release -- --data-dir ./data --dbname bookstore
+```
+
+Over TCP with psql:
+
+```sh
+psql -h 127.0.0.1 -p 5432 -d bookstore -U icedb
+```
+
+If the database name does not exist, icedb returns SQLSTATE `3D000`:
+
+```
+psql: error: FATAL: database "nonexistent" does not exist
+```
+
+### Dropping a database
+
+```sql
+DROP DATABASE bookstore_v2;
+DROP DATABASE IF EXISTS bookstore_v2;
+```
+
+The default `icedb` database cannot be dropped. Data files on disk are retained after drop (for safety) — only the registry entry is removed.
+
+### Listing databases
+
+```
+bookstore=# \l
+                                  List of databases
+   Name      |  Owner
+-------------+----------
+ bookstore   | icedb
+ icedb       | icedb
+```
+
+For the complete database management SQL reference, see Chapter 4.
+
+---
 
 ## What Happened Behind the Scenes
 

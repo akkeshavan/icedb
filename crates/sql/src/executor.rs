@@ -19,6 +19,7 @@ use crate::value::Value;
 pub struct ExecutionContext {
     pub xid: Xid,
     pub data_dir: std::path::PathBuf,
+    pub db_name: String,
     pub txn_manager: Arc<TransactionManager>,
     pub catalog: Arc<CatalogManager>,
 }
@@ -71,7 +72,7 @@ impl Executor {
                 Ok(ExecutionResult {
                     rows: vec![],
                     rows_affected: 0,
-                    command: "CREATE TABLE".to_string(),
+                    command: format!("CREATE TABLE {}", table_name),
                     col_names: vec![],
                     col_types: vec![],
                 })
@@ -85,7 +86,7 @@ impl Executor {
                 Ok(ExecutionResult {
                     rows: vec![],
                     rows_affected: 0,
-                    command: "DROP TABLE".to_string(),
+                    command: format!("DROP TABLE {}", table_name),
                     col_names: vec![],
                     col_types: vec![],
                 })
@@ -222,6 +223,78 @@ impl Executor {
                 col_names: vec![],
                 col_types: vec![],
             }),
+            LogicalPlan::CreateDatabase { name, if_not_exists } => {
+                use crate::db_manager::{DatabaseRegistry, database_dir, open_engine};
+                let registry = DatabaseRegistry::new(&self.ctx.data_dir);
+                if registry.database_exists(name) {
+                    if *if_not_exists {
+                        return Ok(ExecutionResult {
+                            rows: vec![], rows_affected: 0,
+                            command: format!("CREATE DATABASE {}", name),
+                            col_names: vec![], col_types: vec![],
+                        });
+                    }
+                    return Err(SqlError::Execution(format!(
+                        "database \"{}\" already exists", name
+                    )));
+                }
+                // Validate name
+                if name.is_empty() || name.contains('/') || name.contains('\\') {
+                    return Err(SqlError::Execution(format!(
+                        "invalid database name \"{}\"", name
+                    )));
+                }
+                // Create directory and bootstrap catalog
+                let db_dir = database_dir(&self.ctx.data_dir, name);
+                std::fs::create_dir_all(&db_dir).map_err(|e| {
+                    SqlError::Execution(format!("cannot create database directory: {}", e))
+                })?;
+                open_engine(&db_dir, name)?;
+                // Register
+                registry.register(name, "icedb").map_err(|e| {
+                    SqlError::Execution(format!("cannot register database: {}", e))
+                })?;
+                Ok(ExecutionResult {
+                    rows: vec![], rows_affected: 0,
+                    command: format!("CREATE DATABASE {}", name),
+                    col_names: vec![], col_types: vec![],
+                })
+            }
+            LogicalPlan::DropDatabase { name, if_exists } => {
+                use crate::db_manager::{DatabaseRegistry, database_dir};
+                if name == "icedb" {
+                    return Err(SqlError::Execution(
+                        "cannot drop the default database \"icedb\"".to_string()
+                    ));
+                }
+                let registry = DatabaseRegistry::new(&self.ctx.data_dir);
+                if !registry.database_exists(name) {
+                    if *if_exists {
+                        return Ok(ExecutionResult {
+                            rows: vec![], rows_affected: 0,
+                            command: format!("DROP DATABASE {}", name),
+                            col_names: vec![], col_types: vec![],
+                        });
+                    }
+                    return Err(SqlError::Execution(format!(
+                        "database \"{}\" does not exist", name
+                    )));
+                }
+                let db_dir = database_dir(&self.ctx.data_dir, name);
+                if db_dir.exists() {
+                    std::fs::remove_dir_all(&db_dir).map_err(|e| {
+                        SqlError::Execution(format!("cannot remove database directory: {}", e))
+                    })?;
+                }
+                registry.unregister(name).map_err(|e| {
+                    SqlError::Execution(format!("cannot unregister database: {}", e))
+                })?;
+                Ok(ExecutionResult {
+                    rows: vec![], rows_affected: 0,
+                    command: format!("DROP DATABASE {}", name),
+                    col_names: vec![], col_types: vec![],
+                })
+            }
             LogicalPlan::CreateSchema { name, if_not_exists } => {
                 self.ctx.catalog.create_namespace(name, *if_not_exists)
                     .map_err(|e| SqlError::Execution(e.to_string()))?;
@@ -3259,7 +3332,7 @@ impl Executor {
                 Ok(Value::Text(format!("icedb {} ({})", env!("CARGO_PKG_VERSION"), std::env::consts::OS)))
             }
             "current_database" | "current_catalog" => {
-                Ok(Value::Text("icedb".to_string()))
+                Ok(Value::Text(self.ctx.db_name.clone()))
             }
             "current_schema" => {
                 Ok(Value::Text("public".to_string()))
@@ -5031,6 +5104,23 @@ impl Executor {
                         schema_cols.clone(),
                     ));
                 }
+                Ok(rows)
+            }
+
+            ("pg_catalog", "pg_database") => {
+                use crate::db_manager::DatabaseRegistry;
+                let registry = DatabaseRegistry::new(&self.ctx.data_dir);
+                let dbs = registry.list();
+                let schema: Vec<(String, catalog::DataType)> = vec![
+                    ("datname".to_string(), catalog::DataType::Text),
+                    ("datowner".to_string(), catalog::DataType::Text),
+                ];
+                let rows: Vec<Row> = dbs.into_iter().map(|db| {
+                    Row::new(
+                        vec![Value::Text(db.name), Value::Text(db.owner)],
+                        schema.clone(),
+                    )
+                }).collect();
                 Ok(rows)
             }
 

@@ -8,7 +8,7 @@ use crate::lock::LockManager;
 use crate::snapshot::Snapshot;
 use crate::transaction::{IsolationLevel, Transaction, TransactionState};
 use crate::visibility::is_tuple_visible;
-use crate::xid::{allocate_xid, Xid, INVALID_XID};
+use crate::xid::{advance_next_xid, allocate_xid, Xid, INVALID_XID};
 use storage::heap::HeapFile;
 use storage::page::Page;
 use storage::tid::TID;
@@ -87,11 +87,17 @@ impl TransactionManager {
                     Err(_) => break,
                 }
             }
-            // Update next_xid so new transactions get fresh XIDs
+            // Advance both the per-manager counter and the process-global XID
+            // allocator so new transactions always get XIDs larger than any
+            // XID that already exists in heap files.  Without advancing the
+            // global, a restarted process takes snapshots whose xmax is
+            // smaller than old committed XIDs, making those tuples invisible.
+            let recovered_next = max_xid.saturating_add(1);
+            advance_next_xid(recovered_next);
             {
                 let mut inner = mgr.inner.lock();
-                if max_xid + 1 > inner.next_xid {
-                    inner.next_xid = max_xid + 1;
+                if recovered_next > inner.next_xid {
+                    inner.next_xid = recovered_next;
                 }
             }
         }

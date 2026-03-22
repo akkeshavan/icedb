@@ -2,6 +2,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use catalog::manager::CatalogManager;
+use sql::db_manager::DatabaseManager;
 use sql::engine::QueryEngine;
 use txn::manager::TransactionManager;
 use wal::writer::WalWriter;
@@ -15,6 +16,13 @@ fn setup_engine(dir: &std::path::Path) -> Arc<QueryEngine> {
     Arc::new(QueryEngine::new(txn, catalog, dir.to_path_buf()))
 }
 
+fn setup_db_manager(dir: &std::path::Path) -> Arc<DatabaseManager> {
+    let engine = setup_engine(dir);
+    let mgr = Arc::new(DatabaseManager::new(dir.to_path_buf()));
+    mgr.register_engine("icedb", engine);
+    mgr
+}
+
 #[test]
 fn test_handler_executes_create_table() {
     let dir = TempDir::new().unwrap();
@@ -24,7 +32,7 @@ fn test_handler_executes_create_table() {
     let result = engine
         .execute("CREATE TABLE test_net (id INT4, name TEXT)")
         .unwrap();
-    assert_eq!(result.command, "CREATE TABLE");
+    assert_eq!(result.command, "CREATE TABLE test_net");
 }
 
 #[test]
@@ -53,17 +61,17 @@ fn test_handler_creation() {
     let txn = Arc::new(TransactionManager::new(Arc::clone(&wal)));
     let catalog =
         Arc::new(CatalogManager::open(dir.path(), Arc::clone(&wal), Arc::clone(&txn)).unwrap());
-    let engine = setup_engine(dir.path());
+    let db_manager = setup_db_manager(dir.path());
     let auth = Arc::new(auth::Authenticator::new(catalog));
 
     // Verify IceDbHandler can be constructed
-    let _handler = IceDbHandler::new(engine, auth);
+    let _handler = IceDbHandler::new(db_manager, auth);
 }
 
 #[tokio::test]
 async fn test_server_starts() {
     let dir = TempDir::new().unwrap();
-    let engine = setup_engine(dir.path());
+    let db_manager = setup_db_manager(dir.path());
     let wal = Arc::new(WalWriter::open(dir.path()).unwrap());
     let txn = Arc::new(TransactionManager::new(Arc::clone(&wal)));
     let catalog =
@@ -72,7 +80,7 @@ async fn test_server_starts() {
 
     // Bind to port 0 to get a random available port
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let server = crate::Server::new(engine, auth, bind_addr);
+    let server = crate::Server::new(db_manager, auth, bind_addr);
 
     // Spawn the server and immediately cancel it — just verify it binds without error
     let handle = tokio::spawn(async move { server.run().await.unwrap_or(()) });

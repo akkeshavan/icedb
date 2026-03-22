@@ -1894,6 +1894,7 @@ dependencies = [
  "env_logger",
  "log",
  "parking_lot",
+ "serde_json",
  "sqlparser",
  "storage",
  "tempfile",

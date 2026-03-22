@@ -22,9 +22,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Starting icedb server at {}", addr);
     log::info!("Data directory: {}", data_dir.display());
 
-    // Initialize components
+    // Initialize the default "icedb" database engine
     let wal_writer = Arc::new(wal::WalWriter::open(&data_dir)?);
-    let txn_manager = Arc::new(txn::TransactionManager::new(Arc::clone(&wal_writer)));
+    let txn_manager = Arc::new(txn::TransactionManager::new_with_wal_recovery(Arc::clone(&wal_writer), &data_dir));
     let catalog = Arc::new(catalog::CatalogManager::open(
         &data_dir,
         Arc::clone(&wal_writer),
@@ -35,9 +35,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&catalog),
         data_dir.clone(),
     ));
+
+    // DatabaseManager: all databases share one manager; default engine is pre-registered
+    let db_manager = Arc::new(sql::DatabaseManager::new(data_dir.clone()));
+    db_manager.register_engine("icedb", Arc::clone(&engine));
+
     let authenticator = Arc::new(auth::Authenticator::new(Arc::clone(&catalog)));
 
-    let server = network::Server::new(engine, authenticator, addr);
+    let server = network::Server::new(db_manager, authenticator, addr);
     let server = match (tls_cert, tls_key) {
         (Some(cert), Some(key)) => {
             let acceptor = network::build_tls_acceptor(&cert, &key)?;

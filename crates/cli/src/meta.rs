@@ -6,6 +6,7 @@ pub enum MetaCommand {
     ListTables,       // \d or \dt
     ListRoles,        // \du
     ListDatabases,    // \l
+    Connect(String),  // \c dbname
     Quit,             // \q
     Help,             // \?
     Describe(String), // \d tablename
@@ -39,6 +40,12 @@ pub fn parse_meta_command(input: &str) -> Result<MetaCommand, CliError> {
     if let Some(table_name) = input.strip_prefix("\\d ") {
         return Ok(MetaCommand::Describe(table_name.trim().to_string()));
     }
+    if let Some(db) = input.strip_prefix("\\c ").or_else(|| input.strip_prefix("\\connect ")) {
+        return Ok(MetaCommand::Connect(db.trim().to_string()));
+    }
+    if input == "\\c" || input == "\\connect" {
+        return Ok(MetaCommand::Connect("icedb".to_string()));
+    }
     Err(CliError::UnknownMetaCommand(input.to_string()))
 }
 
@@ -48,6 +55,7 @@ pub fn execute_meta_command(
     _engine: &Arc<sql::QueryEngine>,
     timing: &mut bool,
     expanded: &mut bool,
+    data_dir: &std::path::Path,
 ) -> Result<String, CliError> {
     match cmd {
         MetaCommand::Quit => Ok("\\q".to_string()),  // caller handles quit
@@ -82,7 +90,17 @@ pub fn execute_meta_command(
             Ok("                                   List of roles\n Role name |  Attributes  \n-----------+--------------\n postgres  | Superuser\n".to_string())
         }
         MetaCommand::ListDatabases => {
-            Ok("                                  List of databases\n   Name    |  Owner   \n-----------+----------\n postgres  | postgres \n".to_string())
+            let registry = sql::db_manager::DatabaseRegistry::new(data_dir);
+            let dbs = registry.list();
+            let mut out = String::from("                                  List of databases\n   Name   |  Owner   \n----------+----------\n");
+            for db in &dbs {
+                out.push_str(&format!(" {:<8} | {}\n", db.name, db.owner));
+            }
+            Ok(out)
+        }
+        MetaCommand::Connect(db_name) => {
+            // Returned as a special sentinel; the REPL handles engine switching.
+            Ok(format!("\\c {}", db_name))
         }
         MetaCommand::Describe(table_name) => {
             // Show column definitions
@@ -115,6 +133,7 @@ Informational
   \dt            list tables
   \du            list roles
   \l             list databases
+  \c [DBNAME]    connect to new database
 
 Formatting
   \timing        toggle timing of commands

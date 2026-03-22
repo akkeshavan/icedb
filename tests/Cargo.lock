@@ -572,6 +572,7 @@ dependencies = [
  "catalog",
  "log",
  "parking_lot",
+ "serde_json",
  "sqlparser",
  "storage",
  "thiserror",
