@@ -11,8 +11,9 @@ pub struct FunctionDef {
     pub language: String, // "sql" (we only support "sql" for now)
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub enum FkAction {
+    #[default]
     NoAction,
     Cascade,
     SetNull,
@@ -33,6 +34,8 @@ pub struct TableForeignKey {
     pub ref_table: String,
     pub ref_col: String,
     pub on_delete: FkAction,
+    #[serde(default)]
+    pub on_update: FkAction,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

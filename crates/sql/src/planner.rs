@@ -13,7 +13,8 @@ use sqlparser::ast::{
 use crate::error::SqlError;
 use crate::plan::{
     AggFunc, AlterTableOp, BinaryOp, Expr, InsertSource, JoinAlgorithm, JoinType, LogicalPlan,
-    OnConflict, OnConflictAction, SetOperation, SortKey, UnaryOp, WindowExpr, WindowFunction,
+    OnConflict, OnConflictAction, SetOperation, SortKey, UnaryOp, WindowExpr, WindowFrame,
+    WindowFrameBound, WindowFrameUnits, WindowFunction,
 };
 use crate::value::Value;
 
@@ -108,8 +109,69 @@ impl Planner {
                         .unwrap_or_default();
                     Ok(LogicalPlan::DropDatabase { name, if_exists: *if_exists })
                 }
+                ast::ObjectType::Sequence => {
+                    let (schema_name, seq_name) = names.first()
+                        .map(|n| {
+                            let parts: Vec<_> = n.0.iter().map(|i| i.value.clone()).collect();
+                            if parts.len() >= 2 {
+                                (parts[parts.len()-2].clone(), parts[parts.len()-1].clone())
+                            } else {
+                                ("public".to_string(), parts.last().cloned().unwrap_or_default())
+                            }
+                        })
+                        .unwrap_or_else(|| ("public".to_string(), String::new()));
+                    Ok(LogicalPlan::DropSequence { name: seq_name, schema_name, if_exists: *if_exists })
+                }
                 _ => Err(SqlError::NotImplemented(format!("DROP {:?}", object_type))),
             },
+            Statement::CreateSequence { name, if_not_exists, sequence_options, .. } => {
+                let (schema_name, seq_name) = {
+                    let parts: Vec<_> = name.0.iter().map(|i| i.value.clone()).collect();
+                    if parts.len() >= 2 {
+                        (parts[parts.len()-2].clone(), parts[parts.len()-1].clone())
+                    } else {
+                        ("public".to_string(), parts.last().cloned().unwrap_or_default())
+                    }
+                };
+                let mut start: i64 = 1;
+                let mut increment: i64 = 1;
+                let mut min_value: Option<i64> = None;
+                let mut max_value: Option<i64> = None;
+                for opt in sequence_options {
+                    match opt {
+                        sqlparser::ast::SequenceOptions::StartWith(expr, _) => {
+                            if let AstExpr::Value(AstValue::Number(n, _)) = expr {
+                                start = n.parse().unwrap_or(1);
+                            }
+                        }
+                        sqlparser::ast::SequenceOptions::IncrementBy(expr, _) => {
+                            if let AstExpr::Value(AstValue::Number(n, _)) = expr {
+                                increment = n.parse().unwrap_or(1);
+                            }
+                        }
+                        sqlparser::ast::SequenceOptions::MinValue(Some(expr)) => {
+                            if let AstExpr::Value(AstValue::Number(n, _)) = expr {
+                                min_value = n.parse().ok();
+                            }
+                        }
+                        sqlparser::ast::SequenceOptions::MaxValue(Some(expr)) => {
+                            if let AstExpr::Value(AstValue::Number(n, _)) = expr {
+                                max_value = n.parse().ok();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(LogicalPlan::CreateSequence {
+                    name: seq_name,
+                    schema_name,
+                    start,
+                    increment,
+                    min_value,
+                    max_value,
+                    if_not_exists: *if_not_exists,
+                })
+            }
             Statement::CreateRole {
                 names,
                 superuser,
@@ -804,8 +866,8 @@ impl Planner {
             if has_window_function(expr_ast) {
                 if let AstExpr::Function(f) = expr_ast {
                     let func_name = f.name.to_string().to_lowercase();
-                    // Parse partition_by and order_by from the OVER clause
-                    let (partition_by, order_by) = if let Some(over) = &f.over {
+                    // Parse partition_by, order_by and window frame from the OVER clause
+                    let (partition_by, order_by, win_frame) = if let Some(over) = &f.over {
                         match over {
                             ast::WindowType::WindowSpec(spec) => {
                                 let pb: Result<Vec<Expr>, _> = spec.partition_by.iter()
@@ -821,12 +883,46 @@ impl Planner {
                                         })
                                     })
                                     .collect();
-                                (pb?, ob?)
+                                let frame = spec.window_frame.as_ref().map(|wf| {
+                                    let units = match wf.units {
+                                        ast::WindowFrameUnits::Rows => WindowFrameUnits::Rows,
+                                        ast::WindowFrameUnits::Range => WindowFrameUnits::Range,
+                                        ast::WindowFrameUnits::Groups => WindowFrameUnits::Groups,
+                                    };
+                                    let convert_bound = |b: &ast::WindowFrameBound| -> WindowFrameBound {
+                                        match b {
+                                            ast::WindowFrameBound::Preceding(None) => WindowFrameBound::UnboundedPreceding,
+                                            ast::WindowFrameBound::Preceding(Some(e)) => {
+                                                // Try to extract integer literal
+                                                let n = match e.as_ref() {
+                                                    AstExpr::Value(AstValue::Number(s, _)) => s.parse::<u64>().unwrap_or(1),
+                                                    _ => 1,
+                                                };
+                                                WindowFrameBound::Preceding(n)
+                                            }
+                                            ast::WindowFrameBound::CurrentRow => WindowFrameBound::CurrentRow,
+                                            ast::WindowFrameBound::Following(None) => WindowFrameBound::UnboundedFollowing,
+                                            ast::WindowFrameBound::Following(Some(e)) => {
+                                                let n = match e.as_ref() {
+                                                    AstExpr::Value(AstValue::Number(s, _)) => s.parse::<u64>().unwrap_or(1),
+                                                    _ => 1,
+                                                };
+                                                WindowFrameBound::Following(n)
+                                            }
+                                        }
+                                    };
+                                    let start = convert_bound(&wf.start_bound);
+                                    let end = wf.end_bound.as_ref()
+                                        .map(|b| convert_bound(b))
+                                        .unwrap_or(WindowFrameBound::CurrentRow);
+                                    WindowFrame { units, start, end }
+                                });
+                                (pb?, ob?, frame)
                             }
-                            _ => (vec![], vec![]),
+                            _ => (vec![], vec![], None),
                         }
                     } else {
-                        (vec![], vec![])
+                        (vec![], vec![], None)
                     };
 
                     // Parse the window function
@@ -893,6 +989,7 @@ impl Planner {
                         function: win_func,
                         partition_by,
                         order_by,
+                        frame: win_frame,
                     });
                 }
             }
@@ -1032,6 +1129,7 @@ impl Planner {
         // GROUP BY and aggregates
         let has_agg = self.projection_has_aggregates(&select.projection);
         let group_by_exprs = self.extract_group_by(&select.group_by, &plan)?;
+        let grouping_sets = self.extract_grouping_sets(&select.group_by, &plan)?;
 
         if has_agg || !group_by_exprs.is_empty() {
             let mut aggregates = self.extract_aggregates(&select.projection, &plan)?;
@@ -1052,6 +1150,7 @@ impl Planner {
                 group_by: group_by_exprs,
                 aggregates,
                 having,
+                grouping_sets,
             };
             let agg_output_schema = self.extract_schema_from_plan(&plan);
             let projection_columns =
@@ -1175,6 +1274,7 @@ impl Planner {
         // GROUP BY and aggregates
         let has_agg = self.projection_has_aggregates(&select.projection);
         let group_by_exprs = self.extract_group_by(&select.group_by, &plan)?;
+        let grouping_sets = self.extract_grouping_sets(&select.group_by, &plan)?;
 
         if has_agg || !group_by_exprs.is_empty() {
             let mut aggregates = self.extract_aggregates(&select.projection, &plan)?;
@@ -1201,6 +1301,7 @@ impl Planner {
                 group_by: group_by_exprs,
                 aggregates,
                 having,
+                grouping_sets,
             };
             // After aggregate, build projection using column references to aggregate outputs
             // The aggregate plan produces columns by their alias names
@@ -1302,8 +1403,8 @@ impl Planner {
     fn extract_join_condition_with_using(
         &self,
         constraint: &ast::JoinConstraint,
-        _left: &LogicalPlan,
-        _right: &LogicalPlan,
+        left: &LogicalPlan,
+        right: &LogicalPlan,
     ) -> Result<(Expr, Vec<String>), SqlError> {
         match constraint {
             ast::JoinConstraint::On(expr) => {
@@ -1350,9 +1451,71 @@ impl Planner {
                 Ok((cond, using_names))
             }
             ast::JoinConstraint::Natural => {
-                Err(SqlError::NotImplemented("NATURAL JOIN".to_string()))
+                // Compute common columns between left and right plan schemas
+                let left_cols = self.get_plan_column_names(left);
+                let right_cols = self.get_plan_column_names(right);
+                let common: Vec<String> = left_cols
+                    .iter()
+                    .filter(|c| right_cols.contains(c))
+                    .cloned()
+                    .collect();
+                if common.is_empty() {
+                    // No common columns — treat as cross join
+                    return Ok((Expr::Literal(Value::Bool(true)), vec![]));
+                }
+                let using_names = common.clone();
+                let col_name = common[0].clone();
+                let mut cond = Expr::BinaryOp {
+                    left: Box::new(Expr::Column { table: None, name: col_name.clone() }),
+                    op: BinaryOp::Eq,
+                    right: Box::new(Expr::Column { table: None, name: col_name }),
+                };
+                for c in &common[1..] {
+                    let next = Expr::BinaryOp {
+                        left: Box::new(Expr::Column { table: None, name: c.clone() }),
+                        op: BinaryOp::Eq,
+                        right: Box::new(Expr::Column { table: None, name: c.clone() }),
+                    };
+                    cond = Expr::BinaryOp {
+                        left: Box::new(cond),
+                        op: BinaryOp::And,
+                        right: Box::new(next),
+                    };
+                }
+                Ok((cond, using_names))
             }
             ast::JoinConstraint::None => Ok((Expr::Literal(Value::Bool(true)), vec![])),
+        }
+    }
+
+    /// Extract plain (unqualified) column names from a plan.
+    fn get_plan_column_names(&self, plan: &LogicalPlan) -> Vec<String> {
+        match plan {
+            LogicalPlan::TableScan { schema, .. } => {
+                schema.columns.iter().map(|c| c.name.clone()).collect()
+            }
+            LogicalPlan::IndexScan { schema, .. } => {
+                schema.columns.iter().map(|c| c.name.clone()).collect()
+            }
+            LogicalPlan::Filter { input, .. } => self.get_plan_column_names(input),
+            LogicalPlan::Project { columns, .. } => {
+                columns.iter().map(|(name, _)| name.clone()).collect()
+            }
+            LogicalPlan::Join { left, right, .. } => {
+                let mut cols = self.get_plan_column_names(left);
+                cols.extend(self.get_plan_column_names(right));
+                cols
+            }
+            _ => {
+                // Fall back to extract_schema_from_plan for other plan types
+                self.extract_schema_from_plan(plan)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    // Keep only unqualified names (no dot)
+                    .filter(|n| !n.contains('.'))
+                    .collect()
+            }
         }
     }
 
@@ -1836,11 +1999,141 @@ impl Planner {
     ) -> Result<Vec<Expr>, SqlError> {
         let schema = self.extract_schema_from_plan(plan);
         match group_by {
-            GroupByExpr::Expressions(exprs, _) => exprs
-                .iter()
-                .map(|e| self.convert_expr_with_schema(e, schema.as_ref()))
-                .collect(),
+            GroupByExpr::Expressions(exprs, _) => {
+                let mut result = Vec::new();
+                for e in exprs {
+                    match e {
+                        // ROLLUP/CUBE/GROUPING SETS — collect all column exprs
+                        AstExpr::Rollup(sets) | AstExpr::Cube(sets) | AstExpr::GroupingSets(sets) => {
+                            for set in sets {
+                                for col_expr in set {
+                                    let converted = self.convert_expr_with_schema(col_expr, schema.as_ref())?;
+                                    result.push(converted);
+                                }
+                            }
+                        }
+                        _ => result.push(self.convert_expr_with_schema(e, schema.as_ref())?),
+                    }
+                }
+                Ok(result)
+            }
             GroupByExpr::All(_) => Ok(vec![]),
+        }
+    }
+
+    /// Extract grouping sets from a GROUP BY clause.
+    /// Returns None if this is a plain GROUP BY (no ROLLUP/CUBE/GROUPING SETS).
+    fn extract_grouping_sets(
+        &self,
+        group_by: &GroupByExpr,
+        plan: &LogicalPlan,
+    ) -> Result<Option<Vec<Vec<Expr>>>, SqlError> {
+        let schema = self.extract_schema_from_plan(plan);
+        match group_by {
+            GroupByExpr::Expressions(exprs, _) => {
+                // Check if any expression is a ROLLUP / CUBE / GROUPING SETS
+                let has_special = exprs.iter().any(|e| {
+                    matches!(e, AstExpr::Rollup(_) | AstExpr::Cube(_) | AstExpr::GroupingSets(_))
+                });
+                if !has_special {
+                    return Ok(None);
+                }
+                let mut all_sets: Vec<Vec<Expr>> = Vec::new();
+                for e in exprs {
+                    match e {
+                        AstExpr::Rollup(sets) => {
+                            // Flatten: each inner Vec<Expr> is one "column group"
+                            // For ROLLUP(a, b, c): [(a,b,c), (a,b), (a), ()]
+                            let cols: Vec<Expr> = sets.iter()
+                                .flat_map(|s| s.iter())
+                                .map(|col| self.convert_expr_with_schema(col, schema.as_ref()))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let mut rollup_sets: Vec<Vec<Expr>> = Vec::new();
+                            for i in (0..=cols.len()).rev() {
+                                rollup_sets.push(cols[..i].to_vec());
+                            }
+                            if all_sets.is_empty() {
+                                all_sets = rollup_sets;
+                            } else {
+                                // Cross product with existing sets (for multi-expression cases)
+                                let mut combined = Vec::new();
+                                for existing in &all_sets {
+                                    for new_set in &rollup_sets {
+                                        let mut merged = existing.clone();
+                                        merged.extend(new_set.iter().cloned());
+                                        combined.push(merged);
+                                    }
+                                }
+                                all_sets = combined;
+                            }
+                        }
+                        AstExpr::Cube(sets) => {
+                            let cols: Vec<Expr> = sets.iter()
+                                .flat_map(|s| s.iter())
+                                .map(|col| self.convert_expr_with_schema(col, schema.as_ref()))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let n = cols.len();
+                            let mut cube_sets: Vec<Vec<Expr>> = Vec::new();
+                            // All 2^n subsets
+                            for mask in (0u32..(1u32 << n)).rev() {
+                                let set: Vec<Expr> = cols.iter().enumerate()
+                                    .filter(|(i, _)| mask & (1 << i) != 0)
+                                    .map(|(_, e)| e.clone())
+                                    .collect();
+                                cube_sets.push(set);
+                            }
+                            if all_sets.is_empty() {
+                                all_sets = cube_sets;
+                            } else {
+                                let mut combined = Vec::new();
+                                for existing in &all_sets {
+                                    for new_set in &cube_sets {
+                                        let mut merged = existing.clone();
+                                        merged.extend(new_set.iter().cloned());
+                                        combined.push(merged);
+                                    }
+                                }
+                                all_sets = combined;
+                            }
+                        }
+                        AstExpr::GroupingSets(sets) => {
+                            let converted_sets: Vec<Vec<Expr>> = sets.iter()
+                                .map(|set| {
+                                    set.iter()
+                                        .map(|col| self.convert_expr_with_schema(col, schema.as_ref()))
+                                        .collect::<Result<Vec<_>, _>>()
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            if all_sets.is_empty() {
+                                all_sets = converted_sets;
+                            } else {
+                                let mut combined = Vec::new();
+                                for existing in &all_sets {
+                                    for new_set in &converted_sets {
+                                        let mut merged = existing.clone();
+                                        merged.extend(new_set.iter().cloned());
+                                        combined.push(merged);
+                                    }
+                                }
+                                all_sets = combined;
+                            }
+                        }
+                        _ => {
+                            // Plain column mixed with ROLLUP/CUBE: treat as a regular group
+                            let col = self.convert_expr_with_schema(e, schema.as_ref())?;
+                            if all_sets.is_empty() {
+                                all_sets = vec![vec![col]];
+                            } else {
+                                for set in &mut all_sets {
+                                    set.push(col.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Some(all_sets))
+            }
+            GroupByExpr::All(_) => Ok(None),
         }
     }
 
@@ -2222,7 +2515,7 @@ impl Planner {
             let mut col_fk: Option<catalog::schema::ForeignKey> = None;
             for opt in &col.options {
                 match &opt.option {
-                    ast::ColumnOption::ForeignKey { foreign_table, referred_columns, on_delete, .. } => {
+                    ast::ColumnOption::ForeignKey { foreign_table, referred_columns, on_delete, on_update, .. } => {
                         let ref_table = foreign_table.0.last()
                             .map(|i| i.value.clone())
                             .unwrap_or_default();
@@ -2236,18 +2529,20 @@ impl Planner {
                             Some(ast::ReferentialAction::Restrict) => catalog::schema::FkAction::Restrict,
                             _ => catalog::schema::FkAction::NoAction,
                         };
+                        let on_upd = match on_update {
+                            Some(ast::ReferentialAction::Cascade) => catalog::schema::FkAction::Cascade,
+                            Some(ast::ReferentialAction::SetNull) => catalog::schema::FkAction::SetNull,
+                            Some(ast::ReferentialAction::SetDefault) => catalog::schema::FkAction::SetDefault,
+                            Some(ast::ReferentialAction::Restrict) => catalog::schema::FkAction::Restrict,
+                            _ => catalog::schema::FkAction::NoAction,
+                        };
                         // Also register as table-level FK
                         foreign_keys.push(catalog::schema::TableForeignKey {
                             local_col: col.name.value.clone(),
                             ref_table: ref_table.clone(),
                             ref_col: ref_col.clone(),
-                            on_delete: match on_delete {
-                                Some(ast::ReferentialAction::Cascade) => catalog::schema::FkAction::Cascade,
-                                Some(ast::ReferentialAction::SetNull) => catalog::schema::FkAction::SetNull,
-                                Some(ast::ReferentialAction::SetDefault) => catalog::schema::FkAction::SetDefault,
-                                Some(ast::ReferentialAction::Restrict) => catalog::schema::FkAction::Restrict,
-                                _ => catalog::schema::FkAction::NoAction,
-                            },
+                            on_delete: on_del.clone(),
+                            on_update: on_upd,
                         });
                         col_fk = Some(catalog::schema::ForeignKey { ref_table, ref_col, on_delete: on_del });
                     }
@@ -2294,7 +2589,7 @@ impl Planner {
                         }
                     }
                 }
-                ast::TableConstraint::ForeignKey { columns, foreign_table, referred_columns, on_delete, .. } => {
+                ast::TableConstraint::ForeignKey { columns, foreign_table, referred_columns, on_delete, on_update, .. } => {
                     let ref_table = foreign_table.0.last()
                         .map(|i| i.value.clone())
                         .unwrap_or_default();
@@ -2307,6 +2602,13 @@ impl Planner {
                             ref_table: ref_table.clone(),
                             ref_col: ref_col.clone(),
                             on_delete: match on_delete {
+                                Some(ast::ReferentialAction::Cascade) => catalog::schema::FkAction::Cascade,
+                                Some(ast::ReferentialAction::SetNull) => catalog::schema::FkAction::SetNull,
+                                Some(ast::ReferentialAction::SetDefault) => catalog::schema::FkAction::SetDefault,
+                                Some(ast::ReferentialAction::Restrict) => catalog::schema::FkAction::Restrict,
+                                _ => catalog::schema::FkAction::NoAction,
+                            },
+                            on_update: match on_update {
                                 Some(ast::ReferentialAction::Cascade) => catalog::schema::FkAction::Cascade,
                                 Some(ast::ReferentialAction::SetNull) => catalog::schema::FkAction::SetNull,
                                 Some(ast::ReferentialAction::SetDefault) => catalog::schema::FkAction::SetDefault,
@@ -2376,6 +2678,51 @@ impl Planner {
                 AlterTableOp::RenameTable {
                     new_name: new_name.0.last().map(|i| i.value.clone()).unwrap_or_default(),
                 }
+            }
+            ast::AlterTableOperation::AlterColumn { column_name, op } => {
+                match op {
+                    ast::AlterColumnOperation::SetDataType { data_type, .. } => {
+                        let new_type = self.convert_data_type(data_type)?;
+                        AlterTableOp::SetColumnType {
+                            col_name: column_name.value.clone(),
+                            new_type,
+                        }
+                    }
+                    ast::AlterColumnOperation::SetNotNull => {
+                        AlterTableOp::SetNotNull { col_name: column_name.value.clone() }
+                    }
+                    ast::AlterColumnOperation::DropNotNull => {
+                        AlterTableOp::DropNotNull { col_name: column_name.value.clone() }
+                    }
+                    ast::AlterColumnOperation::SetDefault { value } => {
+                        AlterTableOp::SetDefault {
+                            col_name: column_name.value.clone(),
+                            default_expr: value.to_string(),
+                        }
+                    }
+                    ast::AlterColumnOperation::DropDefault => {
+                        AlterTableOp::DropDefault { col_name: column_name.value.clone() }
+                    }
+                    other => {
+                        return Err(SqlError::NotImplemented(format!("ALTER COLUMN operation: {:?}", other)));
+                    }
+                }
+            }
+            ast::AlterTableOperation::AddConstraint(constraint) => {
+                match constraint {
+                    ast::TableConstraint::Check { name, expr } => {
+                        AlterTableOp::AddCheckConstraint {
+                            name: name.as_ref().map(|n| n.value.clone()),
+                            expr: expr.to_string(),
+                        }
+                    }
+                    other => {
+                        return Err(SqlError::NotImplemented(format!("ADD CONSTRAINT type: {:?}", other)));
+                    }
+                }
+            }
+            ast::AlterTableOperation::DropConstraint { name, .. } => {
+                AlterTableOp::DropConstraint { name: name.value.clone() }
             }
             other => {
                 return Err(SqlError::NotImplemented(format!("ALTER TABLE operation: {:?}", other)));

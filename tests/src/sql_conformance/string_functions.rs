@@ -109,7 +109,6 @@ fn test_string_trim_both() {
 }
 
 #[test]
-#[ignore = "TRIM(BOTH FROM ...) not parsed by sqlparser-rs 0.53"]
 fn test_string_trim_both_explicit() {
     let dir = TempDir::new().unwrap();
     let engine = make_engine(dir.path());

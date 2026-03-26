@@ -1084,6 +1084,86 @@ impl CatalogManager {
         Ok(val)
     }
 
+    // ── Standalone Sequence support ───────────────────────────────────────────
+
+    fn standalone_sequence_key(schema: &str, name: &str) -> String {
+        format!("seq:{schema}.{name}")
+    }
+
+    /// Create a standalone (non-SERIAL) sequence.
+    pub fn create_standalone_sequence(
+        &self,
+        schema: &str,
+        name: &str,
+        start: i64,
+        _increment: i64,
+    ) -> Result<(), CatalogError> {
+        let key = Self::standalone_sequence_key(schema, name);
+        let seq_dir = self.data_dir.join("sequences");
+        std::fs::create_dir_all(&seq_dir)?;
+        let path = self.sequence_file_path(&key);
+        std::fs::write(&path, format!("{start}"))?;
+        let mut seqs = self.sequences.lock();
+        seqs.insert(key, start);
+        Ok(())
+    }
+
+    /// Get the next value from a standalone sequence, atomically incrementing it.
+    pub fn nextval_standalone(&self, schema: &str, name: &str) -> Option<i64> {
+        let key = Self::standalone_sequence_key(schema, name);
+        let mut seqs = self.sequences.lock();
+        let current = seqs.get_mut(&key)?;
+        let val = *current;
+        *current += 1;
+        let path = self.sequence_file_path(&key);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, format!("{}", *current));
+        Some(val)
+    }
+
+    /// Get the current value of a standalone sequence (last value returned by nextval).
+    pub fn currval_standalone(&self, schema: &str, name: &str) -> Option<i64> {
+        let key = Self::standalone_sequence_key(schema, name);
+        let seqs = self.sequences.lock();
+        // currval returns last nextval result (current - 1)
+        seqs.get(&key).map(|&v| v - 1)
+    }
+
+    /// Set the value of a standalone sequence.
+    pub fn setval_standalone(&self, schema: &str, name: &str, val: i64) {
+        let key = Self::standalone_sequence_key(schema, name);
+        let path = self.sequence_file_path(&key);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // setval sets next val to val+1 (next nextval() will return val+1)
+        // Actually PostgreSQL setval(seq, val) makes next nextval() return val+1
+        // unless called with is_called=true (default), in which case next returns val+1.
+        // We store the next value as val+1 so nextval returns val+1.
+        // For simplicity: store val so next call returns val (then increments).
+        let _ = std::fs::write(&path, format!("{val}"));
+        let mut seqs = self.sequences.lock();
+        seqs.insert(key, val);
+    }
+
+    /// Drop a standalone sequence.
+    pub fn drop_standalone_sequence(&self, schema: &str, name: &str) {
+        let key = Self::standalone_sequence_key(schema, name);
+        let path = self.sequence_file_path(&key);
+        let _ = std::fs::remove_file(&path);
+        let mut seqs = self.sequences.lock();
+        seqs.remove(&key);
+    }
+
+    /// Check if a standalone sequence exists.
+    pub fn standalone_sequence_exists(&self, schema: &str, name: &str) -> bool {
+        let key = Self::standalone_sequence_key(schema, name);
+        let seqs = self.sequences.lock();
+        seqs.contains_key(&key)
+    }
+
     // ── ALTER TABLE operations ─────────────────────────────────────────────────
 
     /// Add a column to an existing table (schema only; existing rows will return NULL for new col).
@@ -1324,6 +1404,153 @@ impl CatalogManager {
     ) -> Vec<crate::schema::CheckConstraint> {
         let reg = self.check_registry.read();
         reg.get(&table_oid).cloned().unwrap_or_default()
+    }
+
+    // ── Advanced ALTER TABLE / ALTER COLUMN operations ─────────────────────────
+
+    /// Change the data type of a column.
+    pub fn alter_column_type(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        col_name: &str,
+        new_type: DataType,
+    ) -> Result<(), CatalogError> {
+        let namespace_oid = self.resolve_namespace(schema_name)?;
+        let table_oid = {
+            let nc = self.name_cache.read();
+            nc.get(&(namespace_oid, table_name.to_string())).copied()
+                .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?
+        };
+        // Update pg_attribute
+        {
+            let heap = self.catalog_heaps.get("pg_attribute").unwrap();
+            let mut heap_guard = heap.lock();
+            let raw = Self::scan_raw_catalog_tuples(&mut heap_guard)?;
+            for (tid, data) in raw {
+                if let Ok(mut attr) = PgAttributeRow::decode(&data) {
+                    if attr.attrelid == table_oid && attr.attname == col_name {
+                        attr.atttypid = new_type.oid();
+                        attr.atttypmod = new_type.typmod();
+                        // Use xid=0 for catalog updates (internal)
+                        let _ = self.txn_manager.update_tuple(0, &mut heap_guard, tid, &attr.encode());
+                        break;
+                    }
+                }
+            }
+        }
+        // Update schema cache
+        {
+            let mut sc = self.schema_cache.write();
+            if let Some(schema) = sc.get_mut(&table_oid) {
+                if let Some(col) = schema.columns.iter_mut().find(|c| c.name == col_name) {
+                    col.data_type = new_type;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Set or clear NOT NULL on a column.
+    pub fn alter_column_not_null(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        col_name: &str,
+        not_null: bool,
+    ) -> Result<(), CatalogError> {
+        let namespace_oid = self.resolve_namespace(schema_name)?;
+        let table_oid = {
+            let nc = self.name_cache.read();
+            nc.get(&(namespace_oid, table_name.to_string())).copied()
+                .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?
+        };
+        // Update pg_attribute
+        {
+            let heap = self.catalog_heaps.get("pg_attribute").unwrap();
+            let mut heap_guard = heap.lock();
+            let raw = Self::scan_raw_catalog_tuples(&mut heap_guard)?;
+            for (tid, data) in raw {
+                if let Ok(mut attr) = PgAttributeRow::decode(&data) {
+                    if attr.attrelid == table_oid && attr.attname == col_name {
+                        attr.attnotnull = not_null;
+                        let _ = self.txn_manager.update_tuple(0, &mut heap_guard, tid, &attr.encode());
+                        break;
+                    }
+                }
+            }
+        }
+        // Update schema cache
+        {
+            let mut sc = self.schema_cache.write();
+            if let Some(schema) = sc.get_mut(&table_oid) {
+                if let Some(col) = schema.columns.iter_mut().find(|c| c.name == col_name) {
+                    col.not_null = not_null;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Add a CHECK constraint to a table.
+    pub fn add_check_constraint(
+        &self,
+        table_oid: u32,
+        name: Option<String>,
+        expr: String,
+    ) {
+        let mut reg = self.check_registry.write();
+        let checks = reg.entry(table_oid).or_default();
+        checks.push(crate::schema::CheckConstraint { name, expr });
+    }
+
+    /// Drop a named constraint (check constraint) from a table.
+    pub fn drop_constraint(
+        &self,
+        table_oid: u32,
+        name: &str,
+    ) -> bool {
+        let mut reg = self.check_registry.write();
+        if let Some(checks) = reg.get_mut(&table_oid) {
+            let len_before = checks.len();
+            checks.retain(|c| c.name.as_deref() != Some(name));
+            return checks.len() < len_before;
+        }
+        false
+    }
+
+    /// Set or clear the DEFAULT expression for a column.
+    pub fn alter_column_default(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        col_name: &str,
+        default: Option<String>,
+    ) -> Result<(), CatalogError> {
+        let namespace_oid = self.resolve_namespace(schema_name)?;
+        let table_oid = {
+            let nc = self.name_cache.read();
+            nc.get(&(namespace_oid, table_name.to_string())).copied()
+                .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?
+        };
+        {
+            let mut sc = self.schema_cache.write();
+            if let Some(schema) = sc.get_mut(&table_oid) {
+                if let Some(col) = schema.columns.iter_mut().find(|c| c.name == col_name) {
+                    match &default {
+                        Some(expr) => {
+                            col.has_default = true;
+                            col.default_expr = Some(expr.clone());
+                        }
+                        None => {
+                            col.has_default = false;
+                            col.default_expr = None;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Rename a table.

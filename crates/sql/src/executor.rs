@@ -11,7 +11,7 @@ use crate::codec::{decode_row, encode_row, encode_sort_key};
 use crate::error::SqlError;
 use crate::plan::{
     AggFunc, AlterTableOp, BinaryOp, Expr, InsertSource, JoinType, LogicalPlan, SetOperation,
-    SortKey, UnaryOp, WindowExpr, WindowFunction,
+    SortKey, UnaryOp, WindowExpr, WindowFrame, WindowFrameBound, WindowFunction,
 };
 use crate::row::Row;
 use crate::value::Value;
@@ -329,6 +329,34 @@ impl Executor {
                     col_types: vec![],
                 })
             }
+            LogicalPlan::CreateSequence { name, schema_name, start, increment, if_not_exists, .. } => {
+                if *if_not_exists && self.ctx.catalog.standalone_sequence_exists(schema_name, name) {
+                    // Already exists, skip silently
+                } else {
+                    self.ctx.catalog.create_standalone_sequence(schema_name, name, *start, *increment)
+                        .map_err(SqlError::Catalog)?;
+                }
+                Ok(ExecutionResult {
+                    rows: vec![],
+                    rows_affected: 0,
+                    command: format!("CREATE SEQUENCE {}", name),
+                    col_names: vec![],
+                    col_types: vec![],
+                })
+            }
+            LogicalPlan::DropSequence { name, schema_name, if_exists } => {
+                if !if_exists && !self.ctx.catalog.standalone_sequence_exists(schema_name, name) {
+                    return Err(SqlError::Execution(format!("sequence \"{}\" does not exist", name)));
+                }
+                self.ctx.catalog.drop_standalone_sequence(schema_name, name);
+                Ok(ExecutionResult {
+                    rows: vec![],
+                    rows_affected: 0,
+                    command: format!("DROP SEQUENCE {}", name),
+                    col_names: vec![],
+                    col_types: vec![],
+                })
+            }
             // Transaction control statements: in auto-commit embedded mode, these are
             // accepted without error. BEGIN/COMMIT/ROLLBACK are processed at the engine
             // level (engine.execute() already wraps each call in a transaction).
@@ -535,9 +563,14 @@ impl Executor {
                 group_by,
                 aggregates,
                 having,
+                grouping_sets,
             } => {
                 let rows = self.exec_plan(input)?;
-                self.exec_aggregate(rows, group_by, aggregates, having.as_ref())
+                if let Some(sets) = grouping_sets {
+                    self.exec_aggregate_grouping_sets(rows, group_by, sets, aggregates, having.as_ref())
+                } else {
+                    self.exec_aggregate(rows, group_by, aggregates, having.as_ref())
+                }
             }
             LogicalPlan::Sort { input, keys } => {
                 let rows = self.exec_plan(input)?;
@@ -725,9 +758,13 @@ impl Executor {
                     Ok(projected)
                 }
             }
-            LogicalPlan::Aggregate { input, group_by, aggregates, having } => {
+            LogicalPlan::Aggregate { input, group_by, aggregates, having, grouping_sets } => {
                 let rows = self.exec_plan_correlated(input, outer_row)?;
-                self.exec_aggregate(rows, group_by, aggregates, having.as_ref())
+                if let Some(sets) = grouping_sets {
+                    self.exec_aggregate_grouping_sets(rows, group_by, sets, aggregates, having.as_ref())
+                } else {
+                    self.exec_aggregate(rows, group_by, aggregates, having.as_ref())
+                }
             }
             LogicalPlan::Sort { input, keys } => {
                 let rows = self.exec_plan_correlated(input, outer_row)?;
@@ -1122,9 +1159,13 @@ impl Executor {
                 let right_rows = self.exec_plan_with_ctes(right, cte_map)?;
                 self.exec_join(left_rows, right_rows, join_type.clone(), condition, using_columns, algorithm)
             }
-            LogicalPlan::Aggregate { input, group_by, aggregates, having } => {
+            LogicalPlan::Aggregate { input, group_by, aggregates, having, grouping_sets } => {
                 let rows = self.exec_plan_with_ctes(input, cte_map)?;
-                self.exec_aggregate(rows, group_by, aggregates, having.as_ref())
+                if let Some(sets) = grouping_sets {
+                    self.exec_aggregate_grouping_sets(rows, group_by, sets, aggregates, having.as_ref())
+                } else {
+                    self.exec_aggregate(rows, group_by, aggregates, having.as_ref())
+                }
             }
             LogicalPlan::Sort { input, keys } => {
                 let rows = self.exec_plan_with_ctes(input, cte_map)?;
@@ -1434,10 +1475,23 @@ impl Executor {
                                                 break 'col_loop;
                                             }
                                             crate::plan::OnConflictAction::DoUpdate { assignments } => {
-                                                // Update the conflicting row
+                                                // Build a combined row: existing conflicting row columns +
+                                                // EXCLUDED pseudo-columns (from the new row being inserted).
+                                                // This allows `EXCLUDED.colname` references in assignments.
+                                                let excluded_schema: Vec<(String, catalog::DataType)> = schema
+                                                    .columns
+                                                    .iter()
+                                                    .map(|c| (format!("excluded.{}", c.name), c.data_type.clone()))
+                                                    .collect();
+                                                let mut combined_schema = row_schema.clone();
+                                                combined_schema.extend(excluded_schema);
+                                                let mut combined_vals = row.values.clone();
+                                                combined_vals.extend(values.iter().cloned());
+                                                let eval_row = Row::new(combined_vals, combined_schema);
+
                                                 let mut updated_row = row.clone();
                                                 for (assign_col, assign_expr) in assignments {
-                                                    let new_val = self.eval_expr(assign_expr, &updated_row)?;
+                                                    let new_val = self.eval_expr(assign_expr, &eval_row)?;
                                                     if let Some(idx) = schema.columns.iter().position(|c| &c.name == assign_col) {
                                                         updated_row.values[idx] = new_val;
                                                     }
@@ -1582,6 +1636,9 @@ impl Executor {
         let mut returning_rows: Vec<Row> = Vec::new();
 
         for (tid, mut row) in to_update {
+            // Capture old row values before applying assignments (needed for FK ON UPDATE CASCADE)
+            let old_row = row.clone();
+
             // Apply assignments
             for (col_name, expr) in assignments {
                 let new_val = self.eval_expr(expr, &row)?;
@@ -1613,7 +1670,7 @@ impl Executor {
                 }
             }
 
-            // Check FK constraints for updated FK columns
+            // Check FK constraints for updated FK columns (referential integrity: parent exists)
             let fks = self.ctx.catalog.get_foreign_keys(schema.oid);
             for fk in &fks {
                 if let Some(local_idx) = schema.columns.iter().position(|c| c.name == fk.local_col) {
@@ -1631,6 +1688,70 @@ impl Executor {
                                 "Foreign key violation: no row in {} where {} = {:?}",
                                 fk.ref_table, fk.ref_col, fk_val
                             )));
+                        }
+                    }
+                }
+            }
+
+            // FK ON UPDATE CASCADE: cascade update to child tables that reference this table's PK
+            if let Some(unique_constraints) = self.ctx.catalog.get_unique_constraints(schema.oid) {
+                if let Some(ref pk) = unique_constraints.primary_key {
+                    // Check if the PK column was actually updated
+                    if let Some(pk_idx) = schema.columns.iter().position(|c| c.name == *pk) {
+                        let old_pk_val = old_row.get_by_idx(pk_idx).cloned().unwrap_or(Value::Null);
+                        let new_pk_val = row.values[pk_idx].clone();
+                        let pk_changed = old_pk_val.partial_cmp(&new_pk_val) != Some(std::cmp::Ordering::Equal);
+                        if pk_changed {
+                            let referencing = self.ctx.catalog.find_referencing_tables("public", &schema.name, pk);
+                            for (child_table_name, child_fk) in &referencing {
+                                if let Ok(child_schema) = self.ctx.catalog.get_table("public", child_table_name) {
+                                    let mut child_heap = self.open_heap(child_schema.oid)?;
+                                    let child_visible = self.ctx.txn_manager.scan_visible_tuples(self.ctx.xid, &mut child_heap)?;
+                                    for (child_tid, child_tuple) in &child_visible {
+                                        let cd = &child_tuple.data;
+                                        let nb = if cd.len() >= 4 { u32::from_le_bytes(cd[0..4].try_into().unwrap()) } else { 0 };
+                                        let rd = if cd.len() >= 4 { &cd[4..] } else { cd };
+                                        if let Ok(cr) = crate::codec::decode_row(rd, nb, &child_schema) {
+                                            if let Some(child_col_idx) = child_schema.columns.iter().position(|c| c.name == child_fk.local_col) {
+                                                if let Some(child_val) = cr.get_by_idx(child_col_idx) {
+                                                    if !matches!(child_val, Value::Null) && child_val.partial_cmp(&old_pk_val) == Some(std::cmp::Ordering::Equal) {
+                                                        match &child_fk.on_update {
+                                                            catalog::schema::FkAction::Cascade => {
+                                                                let mut new_child = cr.clone();
+                                                                new_child.values[child_col_idx] = new_pk_val.clone();
+                                                                let (enc, nbm) = encode_row(&new_child);
+                                                                let mut data = nbm.to_le_bytes().to_vec();
+                                                                data.extend_from_slice(&enc);
+                                                                if let Ok(new_child_tid) = self.ctx.txn_manager.update_tuple(self.ctx.xid, &mut child_heap, *child_tid, &data) {
+                                                                    self.record_undo(crate::subtxn::UndoEntry::Delete { table_oid: child_schema.oid, tid: *child_tid });
+                                                                    self.record_undo(crate::subtxn::UndoEntry::Insert { table_oid: child_schema.oid, tid: new_child_tid });
+                                                                }
+                                                            }
+                                                            catalog::schema::FkAction::SetNull | catalog::schema::FkAction::SetDefault => {
+                                                                let mut new_child = cr.clone();
+                                                                new_child.values[child_col_idx] = Value::Null;
+                                                                let (enc, nbm) = encode_row(&new_child);
+                                                                let mut data = nbm.to_le_bytes().to_vec();
+                                                                data.extend_from_slice(&enc);
+                                                                if let Ok(new_child_tid) = self.ctx.txn_manager.update_tuple(self.ctx.xid, &mut child_heap, *child_tid, &data) {
+                                                                    self.record_undo(crate::subtxn::UndoEntry::Delete { table_oid: child_schema.oid, tid: *child_tid });
+                                                                    self.record_undo(crate::subtxn::UndoEntry::Insert { table_oid: child_schema.oid, tid: new_child_tid });
+                                                                }
+                                                            }
+                                                            catalog::schema::FkAction::Restrict | catalog::schema::FkAction::NoAction => {
+                                                                return Err(SqlError::ConstraintViolation(format!(
+                                                                    "Foreign key violation: row in {} references {} (on update restrict)",
+                                                                    child_table_name, schema.name
+                                                                )));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2347,6 +2468,65 @@ impl Executor {
         Ok(result)
     }
 
+    /// Execute aggregate with ROLLUP/CUBE/GROUPING SETS — run once per grouping set and UNION.
+    fn exec_aggregate_grouping_sets(
+        &self,
+        rows: Vec<Row>,
+        all_group_by: &[Expr],
+        grouping_sets: &[Vec<Expr>],
+        aggregates: &[(String, AggFunc, Expr)],
+        having: Option<&Expr>,
+    ) -> Result<Vec<Row>, SqlError> {
+        let mut result: Vec<Row> = Vec::new();
+
+        for set in grouping_sets {
+            // For this grouping set, run exec_aggregate with just the set's columns.
+            // Columns NOT in the set are replaced by NULL.
+            let set_rows = self.exec_aggregate(rows.clone(), set, aggregates, having)?;
+
+            // We need to produce rows that have ALL group_by columns (with NULLs for missing ones).
+            // The set_rows schema has: [set cols...] [agg cols...]
+            // We want: [all_group_by cols...] [agg cols...]
+            let agg_count = aggregates.len();
+            let set_len = set.len();
+
+            let expanded: Vec<Row> = set_rows.into_iter().map(|row| {
+                // Extract set key values (first set_len columns)
+                let set_values = &row.values[..set_len];
+                // Extract agg values (last agg_count columns)
+                let agg_values = &row.values[set_len..];
+
+                // Build full group_by values with NULL for columns not in this set
+                let mut full_values: Vec<Value> = Vec::with_capacity(all_group_by.len() + agg_count);
+                for (i, _gb_expr) in all_group_by.iter().enumerate() {
+                    // Check if this all_group_by column is in the set (by position in set)
+                    if i < set_len {
+                        full_values.push(set_values[i].clone());
+                    } else {
+                        full_values.push(Value::Null);
+                    }
+                }
+                full_values.extend_from_slice(agg_values);
+
+                // Build schema
+                let mut full_schema: Vec<(String, catalog::DataType)> = all_group_by.iter().enumerate().map(|(i, expr)| {
+                    let col_name = match expr {
+                        Expr::Column { name, .. } => name.clone(),
+                        _ => format!("group_{i}"),
+                    };
+                    (col_name, catalog::DataType::Text)
+                }).collect();
+                full_schema.extend(row.schema[set_len..].to_vec());
+
+                Row::new(full_values, full_schema)
+            }).collect();
+
+            result.extend(expanded);
+        }
+
+        Ok(result)
+    }
+
     fn compute_aggregates(
         &self,
         rows: &[Row],
@@ -2587,6 +2767,13 @@ impl Executor {
                     if let Some(v) = row.get(&qualified) {
                         return Ok(v.clone());
                     }
+                    // Also try lowercase qualifier (e.g. EXCLUDED -> excluded)
+                    let qualified_lower = format!("{}.{}", tbl.to_lowercase(), name.to_lowercase());
+                    if qualified_lower != qualified {
+                        if let Some(v) = row.get(&qualified_lower) {
+                            return Ok(v.clone());
+                        }
+                    }
                 }
                 // Try bare name
                 if let Some(v) = row.get(name) {
@@ -2810,19 +2997,56 @@ impl Executor {
             }
             "trim" | "btrim" => {
                 match eval_str_arg(0)? {
-                    Some(s) => Ok(Value::Text(s.trim().to_string())),
+                    Some(s) => {
+                        if args.len() >= 2 {
+                            // btrim(str, chars) — trim specific characters
+                            match eval_str_arg(1)? {
+                                Some(chars) => {
+                                    let char_set: Vec<char> = chars.chars().collect();
+                                    Ok(Value::Text(s.trim_matches(|c| char_set.contains(&c)).to_string()))
+                                }
+                                None => Ok(Value::Null),
+                            }
+                        } else {
+                            Ok(Value::Text(s.trim().to_string()))
+                        }
+                    }
                     None => Ok(Value::Null),
                 }
             }
             "ltrim" => {
                 match eval_str_arg(0)? {
-                    Some(s) => Ok(Value::Text(s.trim_start().to_string())),
+                    Some(s) => {
+                        if args.len() >= 2 {
+                            match eval_str_arg(1)? {
+                                Some(chars) => {
+                                    let char_set: Vec<char> = chars.chars().collect();
+                                    Ok(Value::Text(s.trim_start_matches(|c| char_set.contains(&c)).to_string()))
+                                }
+                                None => Ok(Value::Null),
+                            }
+                        } else {
+                            Ok(Value::Text(s.trim_start().to_string()))
+                        }
+                    }
                     None => Ok(Value::Null),
                 }
             }
             "rtrim" => {
                 match eval_str_arg(0)? {
-                    Some(s) => Ok(Value::Text(s.trim_end().to_string())),
+                    Some(s) => {
+                        if args.len() >= 2 {
+                            match eval_str_arg(1)? {
+                                Some(chars) => {
+                                    let char_set: Vec<char> = chars.chars().collect();
+                                    Ok(Value::Text(s.trim_end_matches(|c| char_set.contains(&c)).to_string()))
+                                }
+                                None => Ok(Value::Null),
+                            }
+                        } else {
+                            Ok(Value::Text(s.trim_end().to_string()))
+                        }
+                    }
                     None => Ok(Value::Null),
                 }
             }
@@ -3377,6 +3601,43 @@ impl Executor {
             "txid_current" => {
                 Ok(Value::Int8(0))
             }
+            // ── Sequence functions ─────────────────────────────────────────────
+            "nextval" => {
+                let seq_name_raw = match eval_str_arg(0)? {
+                    Some(s) => s,
+                    None => return Err(SqlError::Execution("nextval: sequence name cannot be NULL".to_string())),
+                };
+                let (schema, name) = parse_sequence_name(&seq_name_raw);
+                match self.ctx.catalog.nextval_standalone(&schema, &name) {
+                    Some(v) => Ok(Value::Int8(v)),
+                    None => Err(SqlError::Execution(format!("sequence \"{}\" does not exist", seq_name_raw))),
+                }
+            }
+            "currval" => {
+                let seq_name_raw = match eval_str_arg(0)? {
+                    Some(s) => s,
+                    None => return Err(SqlError::Execution("currval: sequence name cannot be NULL".to_string())),
+                };
+                let (schema, name) = parse_sequence_name(&seq_name_raw);
+                match self.ctx.catalog.currval_standalone(&schema, &name) {
+                    Some(v) => Ok(Value::Int8(v)),
+                    None => Err(SqlError::Execution(format!("sequence \"{}\" does not exist or nextval has not been called", seq_name_raw))),
+                }
+            }
+            "setval" => {
+                let seq_name_raw = match eval_str_arg(0)? {
+                    Some(s) => s,
+                    None => return Err(SqlError::Execution("setval: sequence name cannot be NULL".to_string())),
+                };
+                let val = match self.eval_expr(&args[1], row)? {
+                    Value::Int8(v) => v,
+                    Value::Int4(v) => v as i64,
+                    other => return Err(SqlError::Execution(format!("setval: expected integer, got {:?}", other))),
+                };
+                let (schema, name) = parse_sequence_name(&seq_name_raw);
+                self.ctx.catalog.setval_standalone(&schema, &name, val);
+                Ok(Value::Int8(val))
+            }
             _ => {
                 // Look up user-defined SQL functions in the catalog
                 let func_name = name.to_lowercase();
@@ -3563,6 +3824,29 @@ impl Executor {
         }
     }
 
+    fn frame_range(frame: &Option<WindowFrame>, current_idx: usize, partition_len: usize) -> (usize, usize) {
+        match frame {
+            None => (0, current_idx + 1), // default: RANGE UNBOUNDED PRECEDING TO CURRENT ROW
+            Some(f) => {
+                let start = match &f.start {
+                    WindowFrameBound::UnboundedPreceding => 0,
+                    WindowFrameBound::Preceding(n) => current_idx.saturating_sub(*n as usize),
+                    WindowFrameBound::CurrentRow => current_idx,
+                    WindowFrameBound::Following(n) => (current_idx + *n as usize).min(partition_len.saturating_sub(1)),
+                    WindowFrameBound::UnboundedFollowing => partition_len.saturating_sub(1),
+                };
+                let end = match &f.end {
+                    WindowFrameBound::UnboundedPreceding => 0,
+                    WindowFrameBound::Preceding(n) => current_idx.saturating_sub(*n as usize),
+                    WindowFrameBound::CurrentRow => current_idx + 1,
+                    WindowFrameBound::Following(n) => (current_idx + *n as usize + 1).min(partition_len),
+                    WindowFrameBound::UnboundedFollowing => partition_len,
+                };
+                (start, end)
+            }
+        }
+    }
+
     fn exec_window(
         &self,
         rows: Vec<Row>,
@@ -3697,9 +3981,9 @@ impl Executor {
                     }
                 }
                 WindowFunction::Sum(arg_expr) => {
-                    // Running sum (with ORDER BY) or full partition sum (without ORDER BY)
-                    if win_expr.order_by.is_empty() {
-                        // Full partition sum
+                    let n = sorted_indices.len();
+                    if win_expr.frame.is_none() && win_expr.order_by.is_empty() {
+                        // No frame, no ORDER BY: full partition sum
                         let mut sum: Option<Value> = None;
                         for &row_idx in &sorted_indices {
                             let v = self.eval_expr(arg_expr, &rows[row_idx])?;
@@ -3715,80 +3999,159 @@ impl Executor {
                             window_values[row_idx] = s.clone();
                         }
                     } else {
-                        // Running sum
-                        let mut running: Option<Value> = None;
-                        for &row_idx in &sorted_indices {
-                            let v = self.eval_expr(arg_expr, &rows[row_idx])?;
-                            if !matches!(v, Value::Null) {
-                                running = Some(match running {
-                                    None => v,
-                                    Some(acc) => self.eval_binary_op(acc, &BinaryOp::Add, v)?,
-                                });
+                        // Frame-based (or running sum with ORDER BY)
+                        for (pos, &row_idx) in sorted_indices.iter().enumerate() {
+                            let (start, end) = Self::frame_range(&win_expr.frame, pos, n);
+                            let mut sum: Option<Value> = None;
+                            for frame_pos in start..end {
+                                let frame_idx = sorted_indices[frame_pos];
+                                let v = self.eval_expr(arg_expr, &rows[frame_idx])?;
+                                if !matches!(v, Value::Null) {
+                                    sum = Some(match sum {
+                                        None => v,
+                                        Some(acc) => self.eval_binary_op(acc, &BinaryOp::Add, v)?,
+                                    });
+                                }
                             }
-                            window_values[row_idx] = running.clone().unwrap_or(Value::Null);
+                            window_values[row_idx] = sum.unwrap_or(Value::Null);
                         }
                     }
                 }
                 WindowFunction::Count(arg_expr) => {
-                    let n = sorted_indices.iter().filter(|&&idx| {
-                        self.eval_expr(arg_expr, &rows[idx])
-                            .map(|v| !matches!(v, Value::Null))
-                            .unwrap_or(false)
-                    }).count();
-                    let count_val = Value::Int8(n as i64);
-                    for &row_idx in &sorted_indices {
-                        window_values[row_idx] = count_val.clone();
+                    let n = sorted_indices.len();
+                    if win_expr.frame.is_none() && win_expr.order_by.is_empty() {
+                        // No frame, no ORDER BY: whole partition count
+                        let count = sorted_indices.iter().filter(|&&idx| {
+                            self.eval_expr(arg_expr, &rows[idx])
+                                .map(|v| !matches!(v, Value::Null))
+                                .unwrap_or(false)
+                        }).count();
+                        let count_val = Value::Int8(count as i64);
+                        for &row_idx in &sorted_indices {
+                            window_values[row_idx] = count_val.clone();
+                        }
+                    } else {
+                        for (pos, &row_idx) in sorted_indices.iter().enumerate() {
+                            let (start, end) = Self::frame_range(&win_expr.frame, pos, n);
+                            let count = (start..end).filter(|&fp| {
+                                let fi = sorted_indices[fp];
+                                self.eval_expr(arg_expr, &rows[fi])
+                                    .map(|v| !matches!(v, Value::Null))
+                                    .unwrap_or(false)
+                            }).count();
+                            window_values[row_idx] = Value::Int8(count as i64);
+                        }
                     }
                 }
                 WindowFunction::Min(arg_expr) => {
-                    let mut min: Option<Value> = None;
-                    for &row_idx in &sorted_indices {
-                        let v = self.eval_expr(arg_expr, &rows[row_idx])?;
-                        if !matches!(v, Value::Null) {
-                            min = Some(match min {
-                                None => v.clone(),
-                                Some(acc) => if v.partial_cmp(&acc) == Some(std::cmp::Ordering::Less) { v } else { acc },
-                            });
+                    let n = sorted_indices.len();
+                    if win_expr.frame.is_none() && win_expr.order_by.is_empty() {
+                        let mut min: Option<Value> = None;
+                        for &row_idx in &sorted_indices {
+                            let v = self.eval_expr(arg_expr, &rows[row_idx])?;
+                            if !matches!(v, Value::Null) {
+                                min = Some(match min {
+                                    None => v.clone(),
+                                    Some(acc) => if v.partial_cmp(&acc) == Some(std::cmp::Ordering::Less) { v } else { acc },
+                                });
+                            }
                         }
-                    }
-                    let min_val = min.unwrap_or(Value::Null);
-                    for &row_idx in &sorted_indices {
-                        window_values[row_idx] = min_val.clone();
+                        let min_val = min.unwrap_or(Value::Null);
+                        for &row_idx in &sorted_indices {
+                            window_values[row_idx] = min_val.clone();
+                        }
+                    } else {
+                        for (pos, &row_idx) in sorted_indices.iter().enumerate() {
+                            let (start, end) = Self::frame_range(&win_expr.frame, pos, n);
+                            let mut min: Option<Value> = None;
+                            for fp in start..end {
+                                let fi = sorted_indices[fp];
+                                let v = self.eval_expr(arg_expr, &rows[fi])?;
+                                if !matches!(v, Value::Null) {
+                                    min = Some(match min {
+                                        None => v.clone(),
+                                        Some(acc) => if v.partial_cmp(&acc) == Some(std::cmp::Ordering::Less) { v } else { acc },
+                                    });
+                                }
+                            }
+                            window_values[row_idx] = min.unwrap_or(Value::Null);
+                        }
                     }
                 }
                 WindowFunction::Max(arg_expr) => {
-                    let mut max: Option<Value> = None;
-                    for &row_idx in &sorted_indices {
-                        let v = self.eval_expr(arg_expr, &rows[row_idx])?;
-                        if !matches!(v, Value::Null) {
-                            max = Some(match max {
-                                None => v.clone(),
-                                Some(acc) => if v.partial_cmp(&acc) == Some(std::cmp::Ordering::Greater) { v } else { acc },
-                            });
+                    let n = sorted_indices.len();
+                    if win_expr.frame.is_none() && win_expr.order_by.is_empty() {
+                        let mut max: Option<Value> = None;
+                        for &row_idx in &sorted_indices {
+                            let v = self.eval_expr(arg_expr, &rows[row_idx])?;
+                            if !matches!(v, Value::Null) {
+                                max = Some(match max {
+                                    None => v.clone(),
+                                    Some(acc) => if v.partial_cmp(&acc) == Some(std::cmp::Ordering::Greater) { v } else { acc },
+                                });
+                            }
                         }
-                    }
-                    let max_val = max.unwrap_or(Value::Null);
-                    for &row_idx in &sorted_indices {
-                        window_values[row_idx] = max_val.clone();
+                        let max_val = max.unwrap_or(Value::Null);
+                        for &row_idx in &sorted_indices {
+                            window_values[row_idx] = max_val.clone();
+                        }
+                    } else {
+                        for (pos, &row_idx) in sorted_indices.iter().enumerate() {
+                            let (start, end) = Self::frame_range(&win_expr.frame, pos, n);
+                            let mut max: Option<Value> = None;
+                            for fp in start..end {
+                                let fi = sorted_indices[fp];
+                                let v = self.eval_expr(arg_expr, &rows[fi])?;
+                                if !matches!(v, Value::Null) {
+                                    max = Some(match max {
+                                        None => v.clone(),
+                                        Some(acc) => if v.partial_cmp(&acc) == Some(std::cmp::Ordering::Greater) { v } else { acc },
+                                    });
+                                }
+                            }
+                            window_values[row_idx] = max.unwrap_or(Value::Null);
+                        }
                     }
                 }
                 WindowFunction::Avg(arg_expr) => {
-                    let mut sum = 0.0f64;
-                    let mut count = 0i64;
-                    for &row_idx in &sorted_indices {
-                        let v = self.eval_expr(arg_expr, &rows[row_idx])?;
-                        let f = match v {
-                            Value::Int4(i) => i as f64,
-                            Value::Int8(i) => i as f64,
-                            Value::Float8(f) => f,
-                            _ => continue,
-                        };
-                        sum += f;
-                        count += 1;
-                    }
-                    let avg_val = if count == 0 { Value::Null } else { Value::Float8(sum / count as f64) };
-                    for &row_idx in &sorted_indices {
-                        window_values[row_idx] = avg_val.clone();
+                    let n = sorted_indices.len();
+                    if win_expr.frame.is_none() && win_expr.order_by.is_empty() {
+                        let mut sum = 0.0f64;
+                        let mut count = 0i64;
+                        for &row_idx in &sorted_indices {
+                            let v = self.eval_expr(arg_expr, &rows[row_idx])?;
+                            let f = match v {
+                                Value::Int4(i) => i as f64,
+                                Value::Int8(i) => i as f64,
+                                Value::Float8(f) => f,
+                                _ => continue,
+                            };
+                            sum += f;
+                            count += 1;
+                        }
+                        let avg_val = if count == 0 { Value::Null } else { Value::Float8(sum / count as f64) };
+                        for &row_idx in &sorted_indices {
+                            window_values[row_idx] = avg_val.clone();
+                        }
+                    } else {
+                        for (pos, &row_idx) in sorted_indices.iter().enumerate() {
+                            let (start, end) = Self::frame_range(&win_expr.frame, pos, n);
+                            let mut sum = 0.0f64;
+                            let mut count = 0i64;
+                            for fp in start..end {
+                                let fi = sorted_indices[fp];
+                                let v = self.eval_expr(arg_expr, &rows[fi])?;
+                                let f = match v {
+                                    Value::Int4(i) => i as f64,
+                                    Value::Int8(i) => i as f64,
+                                    Value::Float8(f) => f,
+                                    _ => continue,
+                                };
+                                sum += f;
+                                count += 1;
+                            }
+                            window_values[row_idx] = if count == 0 { Value::Null } else { Value::Float8(sum / count as f64) };
+                        }
                     }
                 }
                 WindowFunction::Lead { expr: arg_expr, offset, default } => {
@@ -4048,6 +4411,43 @@ impl Executor {
                     table_name,
                     new_name,
                 ).map_err(SqlError::Catalog)
+            }
+            AlterTableOp::SetColumnType { col_name, new_type } => {
+                self.ctx.catalog.alter_column_type("public", table_name, col_name, new_type.clone())
+                    .map_err(SqlError::Catalog)
+            }
+            AlterTableOp::SetNotNull { col_name } => {
+                self.ctx.catalog.alter_column_not_null("public", table_name, col_name, true)
+                    .map_err(SqlError::Catalog)
+            }
+            AlterTableOp::DropNotNull { col_name } => {
+                self.ctx.catalog.alter_column_not_null("public", table_name, col_name, false)
+                    .map_err(SqlError::Catalog)
+            }
+            AlterTableOp::AddCheckConstraint { name, expr } => {
+                // Need table OID to register constraint
+                let schema = self.ctx.catalog.get_table("public", table_name)
+                    .map_err(SqlError::Catalog)?;
+                self.ctx.catalog.add_check_constraint(schema.oid, name.clone(), expr.clone());
+                Ok(())
+            }
+            AlterTableOp::DropConstraint { name } => {
+                let schema = self.ctx.catalog.get_table("public", table_name)
+                    .map_err(SqlError::Catalog)?;
+                if !self.ctx.catalog.drop_constraint(schema.oid, name) {
+                    return Err(SqlError::Execution(format!(
+                        "constraint \"{}\" of table \"{}\" does not exist", name, table_name
+                    )));
+                }
+                Ok(())
+            }
+            AlterTableOp::SetDefault { col_name, default_expr } => {
+                self.ctx.catalog.alter_column_default("public", table_name, col_name, Some(default_expr.clone()))
+                    .map_err(SqlError::Catalog)
+            }
+            AlterTableOp::DropDefault { col_name } => {
+                self.ctx.catalog.alter_column_default("public", table_name, col_name, None)
+                    .map_err(SqlError::Catalog)
             }
         }
     }
@@ -5365,6 +5765,16 @@ impl Executor {
             .map_err(|e| SqlError::Execution(format!("COPY TO: cannot write file '{}': {}", file_path, e)))?;
 
         Ok(count)
+    }
+}
+
+/// Parse a sequence name string like `'public.myseq'` or `'myseq'` into (schema, name).
+fn parse_sequence_name(raw: &str) -> (String, String) {
+    let s = raw.trim().trim_matches('\'');
+    if let Some(dot) = s.find('.') {
+        (s[..dot].to_string(), s[dot+1..].to_string())
+    } else {
+        ("public".to_string(), s.to_string())
     }
 }
 

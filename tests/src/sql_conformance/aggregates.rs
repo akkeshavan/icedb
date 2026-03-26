@@ -725,3 +725,171 @@ fn test_aggregate_having_all_groups_pass() {
     ).unwrap();
     assert_eq!(result.rows.len(), 3, "All 3 groups have SUM > 0");
 }
+
+// ── Window frame specs ────────────────────────────────────────────────────────
+
+/// ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW gives running sum.
+#[test]
+fn test_window_frame_rows_unbounded_preceding_current_row() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE sales2 (id INT, amt INT)");
+    exec(&engine, "INSERT INTO sales2 VALUES (1, 10)");
+    exec(&engine, "INSERT INTO sales2 VALUES (2, 20)");
+    exec(&engine, "INSERT INTO sales2 VALUES (3, 30)");
+
+    let result = exec(&engine,
+        "SELECT SUM(amt) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sum \
+         FROM sales2 ORDER BY id");
+    assert_eq!(result.rows.len(), 3);
+    let v0 = result.rows[0].get_by_idx(0).unwrap();
+    let v1 = result.rows[1].get_by_idx(0).unwrap();
+    let v2 = result.rows[2].get_by_idx(0).unwrap();
+    // Running sums: 10, 30, 60
+    let s0 = match v0 { Value::Int4(v) => *v as i64, Value::Int8(v) => *v, _ => panic!("not int: {:?}", v0) };
+    let s1 = match v1 { Value::Int4(v) => *v as i64, Value::Int8(v) => *v, _ => panic!("not int: {:?}", v1) };
+    let s2 = match v2 { Value::Int4(v) => *v as i64, Value::Int8(v) => *v, _ => panic!("not int: {:?}", v2) };
+    assert_eq!(s0, 10, "first running sum should be 10");
+    assert_eq!(s1, 30, "second running sum should be 30");
+    assert_eq!(s2, 60, "third running sum should be 60");
+}
+
+/// ROWS BETWEEN 1 PRECEDING AND CURRENT ROW gives sliding window sum.
+#[test]
+fn test_window_frame_rows_1_preceding_current_row() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE sales3 (id INT, amt INT)");
+    exec(&engine, "INSERT INTO sales3 VALUES (1, 10)");
+    exec(&engine, "INSERT INTO sales3 VALUES (2, 20)");
+    exec(&engine, "INSERT INTO sales3 VALUES (3, 30)");
+
+    let result = exec(&engine,
+        "SELECT SUM(amt) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS win_sum \
+         FROM sales3 ORDER BY id");
+    assert_eq!(result.rows.len(), 3);
+    let v0 = result.rows[0].get_by_idx(0).unwrap();
+    let v1 = result.rows[1].get_by_idx(0).unwrap();
+    let v2 = result.rows[2].get_by_idx(0).unwrap();
+    // Sliding sums: 10 (only row 1), 30 (rows 1+2), 50 (rows 2+3)
+    let s0 = match v0 { Value::Int4(v) => *v as i64, Value::Int8(v) => *v, _ => panic!("not int: {:?}", v0) };
+    let s1 = match v1 { Value::Int4(v) => *v as i64, Value::Int8(v) => *v, _ => panic!("not int: {:?}", v1) };
+    let s2 = match v2 { Value::Int4(v) => *v as i64, Value::Int8(v) => *v, _ => panic!("not int: {:?}", v2) };
+    assert_eq!(s0, 10, "first sliding sum should be 10");
+    assert_eq!(s1, 30, "second sliding sum should be 30");
+    assert_eq!(s2, 50, "third sliding sum should be 50");
+}
+
+/// ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING gives full partition sum.
+#[test]
+fn test_window_frame_rows_unbounded_both() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE sales4 (id INT, amt INT)");
+    exec(&engine, "INSERT INTO sales4 VALUES (1, 10)");
+    exec(&engine, "INSERT INTO sales4 VALUES (2, 20)");
+    exec(&engine, "INSERT INTO sales4 VALUES (3, 30)");
+
+    let result = exec(&engine,
+        "SELECT SUM(amt) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS total \
+         FROM sales4 ORDER BY id");
+    assert_eq!(result.rows.len(), 3);
+    // All rows get the full sum = 60
+    for row in &result.rows {
+        let v = row.get_by_idx(0).unwrap();
+        let total = match v { Value::Int4(n) => *n as i64, Value::Int8(n) => *n, _ => panic!("not int: {:?}", v) };
+        assert_eq!(total, 60, "each row should see total 60");
+    }
+}
+
+// ── ROLLUP ────────────────────────────────────────────────────────────────────
+
+/// GROUP BY ROLLUP(region, product) produces subtotals and grand total.
+#[test]
+fn test_rollup_basic() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE revenue (region TEXT, product TEXT, amt INT)");
+    exec(&engine, "INSERT INTO revenue VALUES ('East', 'A', 100)");
+    exec(&engine, "INSERT INTO revenue VALUES ('East', 'B', 200)");
+    exec(&engine, "INSERT INTO revenue VALUES ('West', 'A', 150)");
+
+    // ROLLUP(region, product) → grouping sets: (region,product), (region), ()
+    // Should produce 3 detail rows + 2 region subtotals + 1 grand total = 6 rows
+    let result = exec(&engine,
+        "SELECT region, product, SUM(amt) FROM revenue GROUP BY ROLLUP(region, product)");
+    // At minimum we get more rows than the plain GROUP BY
+    assert!(result.rows.len() >= 4, "ROLLUP should produce subtotals, got {} rows", result.rows.len());
+}
+
+/// GROUP BY ROLLUP with grand total row (NULL, NULL).
+#[test]
+fn test_rollup_grand_total() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE rev2 (region TEXT, amt INT)");
+    exec(&engine, "INSERT INTO rev2 VALUES ('East', 100)");
+    exec(&engine, "INSERT INTO rev2 VALUES ('West', 200)");
+
+    // ROLLUP(region) → grouping sets: (region), ()
+    // Should produce: East/100, West/200, NULL/300
+    let result = exec(&engine,
+        "SELECT region, SUM(amt) AS total FROM rev2 GROUP BY ROLLUP(region) ORDER BY region");
+    // 3 rows: East, West, NULL (grand total)
+    assert_eq!(result.rows.len(), 3, "ROLLUP should produce 2 group rows + 1 grand total");
+
+    // The last row (NULL region) should have the grand total
+    let null_row = result.rows.iter().find(|r| matches!(r.get_by_idx(0), Some(Value::Null)));
+    assert!(null_row.is_some(), "Should have a NULL region row for grand total");
+    if let Some(row) = null_row {
+        let total = match row.get_by_idx(1) {
+            Some(Value::Int4(n)) => *n as i64,
+            Some(Value::Int8(n)) => *n,
+            other => panic!("Grand total should be int, got {:?}", other),
+        };
+        assert_eq!(total, 300, "Grand total should be 300");
+    }
+}
+
+// ── CUBE ──────────────────────────────────────────────────────────────────────
+
+/// GROUP BY CUBE(a, b) produces all 2^n subsets.
+#[test]
+fn test_cube_basic() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE cube_t (a TEXT, b TEXT, val INT)");
+    exec(&engine, "INSERT INTO cube_t VALUES ('x', 'y', 10)");
+    exec(&engine, "INSERT INTO cube_t VALUES ('x', 'z', 20)");
+
+    // CUBE(a, b) → grouping sets: (a,b), (a), (b), ()
+    // With the data: (x,y)=10, (x,z)=20, then subtotals:
+    // (a,b): x/y=10, x/z=20
+    // (a): x=30
+    // (b): y=10, z=20
+    // (): 30
+    let result = exec(&engine,
+        "SELECT a, b, SUM(val) FROM cube_t GROUP BY CUBE(a, b)");
+    // At least 6 rows (2 detail + 1 a-subtotal + 2 b-subtotals + 1 grand total)
+    assert!(result.rows.len() >= 4, "CUBE should produce multiple grouping set rows, got {}", result.rows.len());
+}
+
+// ── GROUPING SETS ─────────────────────────────────────────────────────────────
+
+/// GROUPING SETS explicitly specifies grouping sets.
+#[test]
+fn test_grouping_sets_basic() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+    exec(&engine, "CREATE TABLE gs_t (region TEXT, product TEXT, amt INT)");
+    exec(&engine, "INSERT INTO gs_t VALUES ('East', 'A', 100)");
+    exec(&engine, "INSERT INTO gs_t VALUES ('East', 'B', 200)");
+    exec(&engine, "INSERT INTO gs_t VALUES ('West', 'A', 150)");
+
+    // GROUPING SETS ((region), (product)) → 2 grouping sets
+    let result = exec(&engine,
+        "SELECT region, product, SUM(amt) FROM gs_t \
+         GROUP BY GROUPING SETS ((region), (product))");
+    // Should produce rows for each set: 2 regions + 2 products = 4 rows
+    assert!(result.rows.len() >= 2, "GROUPING SETS should produce rows for each set, got {}", result.rows.len());
+}

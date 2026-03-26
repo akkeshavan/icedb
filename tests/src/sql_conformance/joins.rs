@@ -780,7 +780,6 @@ fn test_join_left_empty_right_table() {
 }
 
 #[test]
-#[ignore = "NATURAL JOIN not implemented"]
 fn test_join_natural_join() {
     let dir = TempDir::new().unwrap();
     let engine = make_engine(dir.path());

@@ -25,6 +25,8 @@ struct SessionState {
     savepoints: Vec<SavepointFrame>,
     /// Shared undo log — populated by the executor, consumed on ROLLBACK TO SAVEPOINT.
     undo_log: Arc<Mutex<Vec<UndoEntry>>>,
+    /// Session-level default isolation level (used for next BEGIN).
+    isolation_level: IsolationLevel,
 }
 
 impl SessionState {
@@ -33,8 +35,44 @@ impl SessionState {
             xid,
             savepoints: Vec::new(),
             undo_log: Arc::new(Mutex::new(Vec::new())),
+            isolation_level: IsolationLevel::ReadCommitted,
         }
     }
+
+    fn with_isolation(xid: Xid, level: IsolationLevel) -> Self {
+        Self {
+            xid,
+            savepoints: Vec::new(),
+            undo_log: Arc::new(Mutex::new(Vec::new())),
+            isolation_level: level,
+        }
+    }
+}
+
+/// Parse an isolation level string (case-insensitive).
+fn parse_isolation_level(s: &str) -> Option<IsolationLevel> {
+    match s.trim().to_ascii_uppercase().as_str() {
+        "READ COMMITTED" | "READ UNCOMMITTED" => Some(IsolationLevel::ReadCommitted),
+        "REPEATABLE READ" => Some(IsolationLevel::RepeatableRead),
+        "SERIALIZABLE" => Some(IsolationLevel::Serializable),
+        _ => None,
+    }
+}
+
+/// Extract isolation level from a SET TRANSACTION or SET SESSION CHARACTERISTICS statement.
+/// Returns `Some(level)` if recognized.
+fn extract_isolation_level(sql_upper: &str) -> Option<IsolationLevel> {
+    // Patterns:
+    //   SET TRANSACTION ISOLATION LEVEL <level>
+    //   SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>
+    let level_str = if let Some(rest) = sql_upper.strip_prefix("SET TRANSACTION ISOLATION LEVEL ") {
+        rest.trim()
+    } else if let Some(rest) = sql_upper.strip_prefix("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ") {
+        rest.trim()
+    } else {
+        return None;
+    };
+    parse_isolation_level(level_str)
 }
 
 pub struct QueryEngine {
@@ -49,6 +87,8 @@ pub struct QueryEngine {
     prepared_statements: Mutex<HashMap<String, String>>,
     /// Per-session transaction state (session_id → SessionState).
     session_states: Mutex<HashMap<String, SessionState>>,
+    /// Per-session default isolation level (outside of open transactions).
+    session_isolation: Mutex<HashMap<String, IsolationLevel>>,
 }
 
 impl QueryEngine {
@@ -74,6 +114,7 @@ impl QueryEngine {
             current_role: None,
             prepared_statements: Mutex::new(HashMap::new()),
             session_states: Mutex::new(HashMap::new()),
+            session_isolation: Mutex::new(HashMap::new()),
         }
     }
 
@@ -526,10 +567,34 @@ impl QueryEngine {
 
         // BEGIN / START TRANSACTION
         if sql_upper == "BEGIN" || sql_upper.starts_with("BEGIN ") || sql_upper.starts_with("START TRANSACTION") {
+            // Extract isolation level from BEGIN ISOLATION LEVEL ... or START TRANSACTION ISOLATION LEVEL ...
+            let inline_level = {
+                let rest = if sql_upper.starts_with("BEGIN ") {
+                    Some(&sql_upper["BEGIN ".len()..])
+                } else if sql_upper.starts_with("START TRANSACTION ") {
+                    Some(&sql_upper["START TRANSACTION ".len()..])
+                } else {
+                    None
+                };
+                rest.and_then(|r| {
+                    let r = r.trim();
+                    if let Some(after) = r.strip_prefix("ISOLATION LEVEL ") {
+                        parse_isolation_level(after)
+                    } else {
+                        None
+                    }
+                })
+            };
             let mut states = self.session_states.lock();
             if !states.contains_key(session_id) {
-                let xid = self.txn_manager.begin(IsolationLevel::ReadCommitted);
-                states.insert(session_id.to_string(), SessionState::new(xid));
+                let level = inline_level.unwrap_or_else(|| {
+                    self.session_isolation.lock()
+                        .get(session_id)
+                        .copied()
+                        .unwrap_or(IsolationLevel::ReadCommitted)
+                });
+                let xid = self.txn_manager.begin(level);
+                states.insert(session_id.to_string(), SessionState::with_isolation(xid, level));
             }
             return Ok(ExecutionResult {
                 rows: vec![], rows_affected: 0,
@@ -630,8 +695,19 @@ impl QueryEngine {
             return Err(SqlError::Execution(format!("savepoint \"{sp_name}\" does not exist")));
         }
 
-        // SET TRANSACTION ... — treat as a no-op (isolation level already set at BEGIN)
-        if sql_upper.starts_with("SET TRANSACTION ") {
+        // SET TRANSACTION ISOLATION LEVEL ... and SET SESSION CHARACTERISTICS AS TRANSACTION ...
+        if sql_upper.starts_with("SET TRANSACTION ")
+            || sql_upper.starts_with("SET SESSION CHARACTERISTICS AS TRANSACTION ")
+        {
+            if let Some(level) = extract_isolation_level(&sql_upper) {
+                // If inside an active transaction, update it immediately.
+                let active_xid = self.session_states.lock().get(session_id).map(|s| s.xid);
+                if let Some(xid) = active_xid {
+                    self.txn_manager.set_isolation_level(xid, level);
+                }
+                // Also store as the session default for the next BEGIN.
+                self.session_isolation.lock().insert(session_id.to_string(), level);
+            }
             return Ok(ExecutionResult {
                 rows: vec![], rows_affected: 0,
                 command: "SET".to_string(), col_names: vec![], col_types: vec![],

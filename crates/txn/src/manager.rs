@@ -535,6 +535,36 @@ impl TransactionManager {
     pub fn is_active(&self, xid: Xid) -> bool {
         self.inner.lock().active.contains_key(&xid)
     }
+
+    /// Update the isolation level of an active transaction.
+    /// Used by SET TRANSACTION ISOLATION LEVEL.
+    pub fn set_isolation_level(&self, xid: Xid, level: IsolationLevel) {
+        let snap_needed;
+        {
+            let mut inner = self.inner.lock();
+            if let Some(txn) = inner.active.get_mut(&xid) {
+                txn.isolation = level;
+                snap_needed = (level == IsolationLevel::RepeatableRead
+                    || level == IsolationLevel::Serializable)
+                    && txn.snapshot.is_none();
+            } else {
+                return;
+            }
+        }
+        if snap_needed {
+            // Take a snapshot outside the first lock to avoid re-entrancy issues
+            let snap = {
+                let inner = self.inner.lock();
+                Self::take_snapshot_inner(&inner, xid)
+            };
+            let mut inner = self.inner.lock();
+            if let Some(txn) = inner.active.get_mut(&xid) {
+                if txn.snapshot.is_none() {
+                    txn.snapshot = Some(snap);
+                }
+            }
+        }
+    }
 }
 
 /// Overwrite the header bytes of an existing tuple slot in a page.

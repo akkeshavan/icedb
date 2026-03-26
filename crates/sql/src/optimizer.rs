@@ -61,11 +61,13 @@ impl Optimizer {
                 group_by,
                 aggregates,
                 having,
+                grouping_sets,
             } => LogicalPlan::Aggregate {
                 input: Box::new(self.optimize(*input)),
                 group_by,
                 aggregates,
                 having,
+                grouping_sets,
             },
             LogicalPlan::Join {
                 left,

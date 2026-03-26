@@ -130,6 +130,9 @@ pub enum LogicalPlan {
         group_by: Vec<Expr>,
         aggregates: Vec<(String, AggFunc, Expr)>,
         having: Option<Expr>,
+        /// For ROLLUP/CUBE/GROUPING SETS: each inner Vec is one grouping set.
+        /// None means a normal GROUP BY (no multi-set expansion).
+        grouping_sets: Option<Vec<Vec<Expr>>>,
     },
     Sort {
         input: Box<LogicalPlan>,
@@ -343,6 +346,22 @@ pub enum LogicalPlan {
     NoOp {
         command: String,
     },
+    /// CREATE SEQUENCE [IF NOT EXISTS] name
+    CreateSequence {
+        name: String,
+        schema_name: String,
+        start: i64,
+        increment: i64,
+        min_value: Option<i64>,
+        max_value: Option<i64>,
+        if_not_exists: bool,
+    },
+    /// DROP SEQUENCE [IF EXISTS] name
+    DropSequence {
+        name: String,
+        schema_name: String,
+        if_exists: bool,
+    },
     /// CREATE DATABASE [IF NOT EXISTS] name
     CreateDatabase {
         name: String,
@@ -411,12 +430,36 @@ pub enum JoinType {
     Cross,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum WindowFrameUnits {
+    Rows,
+    Range,
+    Groups,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum WindowFrameBound {
+    UnboundedPreceding,
+    Preceding(u64),
+    CurrentRow,
+    Following(u64),
+    UnboundedFollowing,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowFrame {
+    pub units: WindowFrameUnits,
+    pub start: WindowFrameBound,
+    pub end: WindowFrameBound,
+}
+
 #[derive(Debug, Clone)]
 pub struct WindowExpr {
     pub output_name: String,
     pub function: WindowFunction,
     pub partition_by: Vec<Expr>,
     pub order_by: Vec<SortKey>,
+    pub frame: Option<WindowFrame>,
 }
 
 #[derive(Debug, Clone)]
@@ -445,6 +488,13 @@ pub enum AlterTableOp {
     DropColumn { name: String },
     RenameColumn { old_name: String, new_name: String },
     RenameTable { new_name: String },
+    SetColumnType { col_name: String, new_type: catalog::DataType },
+    SetNotNull { col_name: String },
+    DropNotNull { col_name: String },
+    AddCheckConstraint { name: Option<String>, expr: String },
+    DropConstraint { name: String },
+    SetDefault { col_name: String, default_expr: String },
+    DropDefault { col_name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -564,7 +564,6 @@ fn test_delete_returning_computed_expression() {
 
 /// INSERT ... ON CONFLICT DO NOTHING (if supported; ignored if not).
 #[test]
-#[ignore = "ON CONFLICT DO NOTHING requires upsert support (Phase 6+ advanced)"]
 fn test_insert_on_conflict_do_nothing() {
     let dir = TempDir::new().unwrap();
     let engine = make_engine(dir.path());
@@ -577,7 +576,6 @@ fn test_insert_on_conflict_do_nothing() {
 
 /// INSERT ... ON CONFLICT DO UPDATE (upsert): ignored if not supported.
 #[test]
-#[ignore = "ON CONFLICT DO UPDATE (upsert) is not yet implemented"]
 fn test_insert_on_conflict_do_update() {
     let dir = TempDir::new().unwrap();
     let engine = make_engine(dir.path());
