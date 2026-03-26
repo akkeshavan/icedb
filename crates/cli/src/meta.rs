@@ -92,7 +92,40 @@ pub fn execute_meta_command(
             }
         }
         MetaCommand::ListRoles => {
-            Ok("                                   List of roles\n Role name |  Attributes  \n-----------+--------------\n icedb     | Superuser\n".to_string())
+            match catalog.list_roles() {
+                Ok(roles) => {
+                    let mut out = String::from(
+                        "                                   List of roles\n\
+                         Role name |          Attributes          \n\
+                         -----------+------------------------------\n",
+                    );
+                    for role in &roles {
+                        let mut attrs: Vec<&str> = Vec::new();
+                        if role.rolsuper {
+                            attrs.push("Superuser");
+                        }
+                        if role.rolcreaterole {
+                            attrs.push("Create role");
+                        }
+                        if role.rolcreatedb {
+                            attrs.push("Create DB");
+                        }
+                        if role.rolbypassrls {
+                            attrs.push("Bypass RLS");
+                        }
+                        if !role.rolcanlogin {
+                            attrs.push("Cannot login");
+                        }
+                        out.push_str(&format!(
+                            " {:<9} | {}\n",
+                            role.rolname,
+                            attrs.join(", ")
+                        ));
+                    }
+                    Ok(out)
+                }
+                Err(e) => Err(CliError::Catalog(e)),
+            }
         }
         MetaCommand::ListDatabases => {
             let registry = sql::db_manager::DatabaseRegistry::new(data_dir);

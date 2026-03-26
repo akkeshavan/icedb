@@ -3,6 +3,8 @@
 **Last updated**: 2026-03-26
 **Test baseline**: 313 unit + 761 integration = 1,074 passing, 0 ignored, 0 failing
 
+> CLI issues 18–21 resolved in the same session (see CLI / Tooling section below).
+
 ---
 
 ## Critical / Data Correctness
@@ -47,12 +49,14 @@ All previously listed critical issues have been resolved.
 
 ## CLI / Tooling
 
-| # | Issue |
-|---|-------|
-| 18 | **`\du` is a hardcoded stub** — always shows `icedb` superuser; does not query `pg_authid` |
-| 19 | **`\x` expanded output** — flag accepted but output format unchanged |
-| 20 | **`.pgpass` file support** — not implemented |
-| 21 | **History file permissions** — `~/.isql_history` should be created with mode 0600 |
+### Resolved
+
+| # | Issue | Status |
+|---|-------|--------|
+| 18 | **`\du` is a hardcoded stub** | ✅ Fixed — `execute_meta_command` now calls `catalog.list_roles()` and formats attributes (Superuser, Create role, Create DB, Bypass RLS, Cannot login) |
+| 19 | **`\x` expanded output** | ✅ Fixed — `format_expanded()` added to `formatter.rs`; `execute_sql` passes `expanded` flag and calls the right formatter |
+| 20 | **`.pgpass` file support** | ✅ Fixed — `Config::from_args` reads `~/.pgpass`, matching `host:port:db:user` with wildcard `*` support; matched password stored in `Config::password` |
+| 21 | **History file permissions** | ✅ Fixed — after `save_history()`, `std::fs::set_permissions` sets mode 0600 (Unix only, `#[cfg(unix)]`-gated) |
 
 ---
 

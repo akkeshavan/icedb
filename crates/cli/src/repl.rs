@@ -1,7 +1,7 @@
 use crate::completer::SqlCompleter;
 use crate::config::Config;
 use crate::error::CliError;
-use crate::formatter::{format_command_result, format_table};
+use crate::formatter::{format_command_result, format_expanded, format_table};
 use crate::meta::{execute_meta_command, parse_meta_command};
 use catalog::manager::CatalogManager;
 use rustyline::error::ReadlineError;
@@ -181,15 +181,23 @@ impl Repl {
             }
         }
 
-        // Save history
+        // Save history and restrict permissions to owner-only (0600)
         if let Some(ref history_file) = self.config.history_file {
             let _ = rl.save_history(history_file);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    history_file,
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
         }
 
         Ok(())
     }
 
-    fn execute_sql(&self, sql: &str, timing: bool, _expanded: bool) -> String {
+    fn execute_sql(&self, sql: &str, timing: bool, expanded: bool) -> String {
         // Strip a trailing semicolon that may remain after splitting
         let sql = sql.trim().trim_end_matches(';').trim();
         let start = std::time::Instant::now();
@@ -200,7 +208,11 @@ impl Repl {
             Ok(result) => {
                 let mut output = String::new();
                 if !result.rows.is_empty() {
-                    output.push_str(&format_table(&result.rows));
+                    if expanded {
+                        output.push_str(&format_expanded(&result.rows));
+                    } else {
+                        output.push_str(&format_table(&result.rows));
+                    }
                 } else {
                     output.push_str(&format_command_result(
                         &result.command,

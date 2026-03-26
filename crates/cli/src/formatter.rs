@@ -60,6 +60,39 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// Format a result set in expanded (vertical) mode, like psql `\x`.
+///
+/// Each row is printed as a block with `column | value` lines, separated by
+/// a record header `-- [ RECORD N ] ---`.
+pub fn format_expanded(rows: &[Row]) -> String {
+    if rows.is_empty() {
+        return "(0 rows)\n".to_string();
+    }
+
+    let schema = &rows[0].schema;
+    let headers: Vec<String> = schema.iter().map(|(name, _)| name.clone()).collect();
+    let max_header_len = headers.iter().map(|h| h.len()).max().unwrap_or(0);
+
+    let mut out = String::new();
+    for (i, row) in rows.iter().enumerate() {
+        out.push_str(&format!("-[ RECORD {} ]", i + 1));
+        out.push('\n');
+        for (header, value) in headers.iter().zip(row.values.iter()) {
+            out.push_str(&format!(
+                "{:<width$} | {}\n",
+                header,
+                format_value(value),
+                width = max_header_len
+            ));
+        }
+    }
+
+    let row_count = rows.len();
+    let plural = if row_count == 1 { "row" } else { "rows" };
+    out.push_str(&format!("({} {})\n", row_count, plural));
+    out
+}
+
 /// Format command result (non-SELECT output)
 pub fn format_command_result(command: &str, _rows_affected: u64) -> String {
     format!("{}\n", command)
