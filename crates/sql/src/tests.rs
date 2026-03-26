@@ -2119,6 +2119,71 @@ fn test_wal_decode_rejects_truncated_record() {
 }
 
 #[test]
+fn test_create_index_backfills_existing_rows() {
+    // INSERT rows BEFORE creating the index — index scan must still find them.
+    let dir = tempdir().unwrap();
+    let engine = make_engine(dir.path());
+
+    engine.execute("CREATE TABLE products (id INT, name TEXT, price INT)").unwrap();
+    engine.execute("INSERT INTO products VALUES (1, 'Apple', 10), (2, 'Banana', 5), (3, 'Cherry', 20)").unwrap();
+
+    // Create index AFTER inserting.
+    engine.execute("CREATE INDEX products_id_idx ON products (id)").unwrap();
+
+    // Index scan must find the pre-existing row.
+    let result = engine.execute("SELECT name FROM products WHERE id = 2").unwrap();
+    assert_eq!(result.rows.len(), 1, "index scan should find pre-existing row; got {:?}", result.rows);
+    match &result.rows[0].values[0] {
+        crate::value::Value::Text(s) => assert_eq!(s, "Banana"),
+        other => panic!("expected 'Banana', got {:?}", other),
+    }
+
+    // All three rows must be reachable.
+    let result = engine.execute("SELECT COUNT(*) FROM products WHERE id >= 1").unwrap();
+    let count = match result.rows[0].get_by_idx(0) {
+        Some(crate::value::Value::Int8(n)) => *n,
+        Some(crate::value::Value::Int4(n)) => *n as i64,
+        other => panic!("unexpected count type: {:?}", other),
+    };
+    assert_eq!(count, 3, "all 3 pre-existing rows must be visible after index creation");
+
+    // INSERT after index creation — new row must also be findable.
+    engine.execute("INSERT INTO products VALUES (4, 'Date', 15)").unwrap();
+    let result = engine.execute("SELECT name FROM products WHERE id = 4").unwrap();
+    assert_eq!(result.rows.len(), 1, "row inserted AFTER index creation must be visible via index scan; got {:?}", result.rows);
+}
+
+#[test]
+fn test_join_using_with_and_without_alias() {
+    // Verify JOIN USING works with explicit aliases (common case reported as broken).
+    let dir = tempdir().unwrap();
+    let engine = make_engine(dir.path());
+
+    engine.execute("CREATE TABLE employees (dept_id INT, name TEXT)").unwrap();
+    engine.execute("CREATE TABLE departments (dept_id INT, dept_name TEXT)").unwrap();
+    engine.execute("INSERT INTO departments VALUES (1, 'Engineering'), (2, 'Marketing')").unwrap();
+    engine.execute("INSERT INTO employees VALUES (1, 'Alice'), (1, 'Bob'), (2, 'Charlie')").unwrap();
+
+    // Inner join with aliases
+    let result = engine.execute(
+        "SELECT e.name, d.dept_name FROM employees e JOIN departments d USING (dept_id) ORDER BY e.name"
+    ).unwrap();
+    assert_eq!(result.rows.len(), 3, "JOIN USING with aliases should return 3 rows; got {:?}", result.rows);
+
+    // Inner join without aliases
+    let result = engine.execute(
+        "SELECT employees.name, departments.dept_name FROM employees JOIN departments USING (dept_id) ORDER BY employees.name"
+    ).unwrap();
+    assert_eq!(result.rows.len(), 3, "JOIN USING without aliases should return 3 rows; got {:?}", result.rows);
+
+    // Left join with USING
+    let result = engine.execute(
+        "SELECT e.name, d.dept_name FROM employees e LEFT JOIN departments d USING (dept_id) ORDER BY e.name"
+    ).unwrap();
+    assert_eq!(result.rows.len(), 3, "LEFT JOIN USING should return 3 rows; got {:?}", result.rows);
+}
+
+#[test]
 fn test_wal_decode_rejects_crc_mismatch() {
     use wal::record::{WalRecord, WalRecordType};
     // Build a valid Commit record, then corrupt the trailing CRC bytes.

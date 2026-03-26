@@ -75,3 +75,4 @@ Thumbs.db
 *.tmp
 *.bak
 /tmp/
+known_issues.md

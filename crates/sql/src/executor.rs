@@ -1501,6 +1501,7 @@ impl Executor {
                 .txn_manager
                 .insert_tuple(self.ctx.xid, &mut heap, &full_data)?;
             self.record_undo(crate::subtxn::UndoEntry::Insert { table_oid, tid });
+            self.maintain_indexes_on_insert(table_oid, schema, &row, tid)?;
             count += 1;
 
             // Build RETURNING row
@@ -1644,6 +1645,7 @@ impl Executor {
                 .update_tuple(self.ctx.xid, &mut heap, tid, &full_data)?;
             self.record_undo(crate::subtxn::UndoEntry::Delete { table_oid: schema.oid, tid });
             self.record_undo(crate::subtxn::UndoEntry::Insert { table_oid: schema.oid, tid: new_tid });
+            self.maintain_indexes_on_insert(schema.oid, schema, &row, new_tid)?;
 
             if !returning.is_empty() {
                 returning_rows.push(self.build_returning_row(&row, returning)?);
@@ -4137,6 +4139,46 @@ impl Executor {
         }
         // Return Null for anything else
         Ok(Value::Null)
+    }
+
+    /// Insert `tid` into every B+ tree index that covers `table_oid`.
+    ///
+    /// Called by exec_insert and exec_update so that new or updated tuples are
+    /// immediately findable via index scan without a process restart.
+    fn maintain_indexes_on_insert(
+        &self,
+        table_oid: u32,
+        schema: &catalog::schema::TableSchema,
+        row: &Row,
+        tid: storage::tid::TID,
+    ) -> Result<(), SqlError> {
+        let indexes = self.ctx.catalog.list_indexes();
+        for (idx_table_oid, col_spec, idx_path) in &indexes {
+            if *idx_table_oid != table_oid {
+                continue;
+            }
+            // Use the leading column (same logic as exec_create_index).
+            let leading_col = col_spec.split(',').next().unwrap_or(col_spec.as_str()).trim();
+            let col_idx = match schema.columns.iter().position(|c| c.name == leading_col) {
+                Some(i) => i,
+                None => continue,
+            };
+            let val = match row.get_by_idx(col_idx) {
+                Some(v) => v,
+                None => continue,
+            };
+            if matches!(val, Value::Null) {
+                continue;
+            }
+            let key = encode_sort_key(val);
+            let wal = Arc::new(
+                wal::writer::WalWriter::open(&self.ctx.data_dir).map_err(SqlError::Wal)?,
+            );
+            if let Ok(btree) = BTree::open(idx_path, wal, table_oid) {
+                let _ = btree.insert(self.ctx.xid, &key, tid);
+            }
+        }
+        Ok(())
     }
 
     /// Build a B+ tree index on `column_name` for `table_name`.

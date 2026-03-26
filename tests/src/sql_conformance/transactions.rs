@@ -656,12 +656,15 @@ fn test_savepoint_name_reuse() {
     exec_session(&engine, sid, "INSERT INTO t VALUES (2)");
     exec_session(&engine, sid, "SAVEPOINT sp"); // redefine: now sp is here
     exec_session(&engine, sid, "INSERT INTO t VALUES (3)");
-    exec_session(&engine, sid, "ROLLBACK TO SAVEPOINT sp"); // aborts txn; rows 2,3 gone
+    // ROLLBACK TO sp rolls back only row 3: the second SAVEPOINT sp redefined the
+    // savepoint to the state AFTER row 2 was inserted, so row 2 is preserved.
+    exec_session(&engine, sid, "ROLLBACK TO SAVEPOINT sp"); // only row 3 gone
     exec_session(&engine, sid, "COMMIT");
 
-    // Only the original committed row 1 survives; 2 and 3 were in the aborted txn
+    // Row 1 (pre-committed) + row 2 (committed via transaction) survive.
+    // Row 3 was rolled back to the savepoint defined after row 2.
     let n = count_rows(&engine, "SELECT * FROM t");
-    assert_eq!(n, 1, "Only pre-committed row 1 survives; in-txn rows 2 and 3 rolled back");
+    assert_eq!(n, 2, "Row 1 (pre-committed) and row 2 (post-savepoint-redefine) survive; row 3 rolled back");
 }
 
 /// BEGIN + work + COMMIT then verify with a fresh SELECT.
