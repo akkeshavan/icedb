@@ -8,6 +8,9 @@ use crate::error::BufferError;
 use crate::heap::HeapFile;
 use crate::page::Page;
 
+/// Maximum number of buffer frames allowed (128 k frames × 8 kB = 1 GB).
+pub const MAX_BUFFER_FRAMES: usize = 131_072;
+
 // ── BufferDescriptor ──────────────────────────────────────────────────────────
 
 /// Metadata for a single buffer frame.
@@ -56,7 +59,11 @@ pub struct BufferPool {
 
 impl BufferPool {
     /// Create a buffer pool with `num_frames` frames backed by `heap`.
+    ///
+    /// `num_frames` is silently capped at [`MAX_BUFFER_FRAMES`] so that a
+    /// misconfigured caller cannot exhaust memory.
     pub fn new(heap: Arc<Mutex<HeapFile>>, num_frames: usize) -> Self {
+        let num_frames = num_frames.min(MAX_BUFFER_FRAMES);
         assert!(num_frames > 0, "buffer pool must have at least one frame");
         let mut frames = Vec::with_capacity(num_frames);
         let mut descriptors = Vec::with_capacity(num_frames);

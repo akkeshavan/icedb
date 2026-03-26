@@ -156,7 +156,14 @@ impl WalRecord {
             });
         }
 
-        let total_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let total_len = u32::from_le_bytes(
+            bytes[0..4]
+                .try_into()
+                .map_err(|_| WalError::CorruptRecord {
+                    lsn: INVALID_LSN,
+                    reason: "failed to read total_len field".to_string(),
+                })?,
+        ) as usize;
         // total_len must be at least FIXED_HEADER_LEN + CRC_LEN to be valid.
         // Checking this before the subtraction below prevents a usize underflow.
         if total_len < FIXED_HEADER_LEN + CRC_LEN {
@@ -180,10 +187,24 @@ impl WalRecord {
 
         // CRC covers everything except the trailing CRC field itself.
         let crc_offset = total_len - CRC_LEN;
-        let stored_crc = u32::from_le_bytes(bytes[crc_offset..crc_offset + 4].try_into().unwrap());
+        let stored_crc = u32::from_le_bytes(
+            bytes[crc_offset..crc_offset + 4]
+                .try_into()
+                .map_err(|_| WalError::CorruptRecord {
+                    lsn: INVALID_LSN,
+                    reason: "failed to read stored CRC field".to_string(),
+                })?,
+        );
         let computed_crc = crc32(&bytes[..crc_offset]);
         if stored_crc != computed_crc {
-            let lsn = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+            let lsn = u64::from_le_bytes(
+            bytes[4..12]
+                .try_into()
+                .map_err(|_| WalError::CorruptRecord {
+                    lsn: INVALID_LSN,
+                    reason: "failed to read LSN field (CRC check)".to_string(),
+                })?,
+        );
             return Err(WalError::CorruptRecord {
                 lsn,
                 reason: format!(
@@ -193,12 +214,47 @@ impl WalRecord {
             });
         }
 
-        let lsn = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
-        let prev_lsn = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
-        let xid = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+        let lsn = u64::from_le_bytes(
+            bytes[4..12]
+                .try_into()
+                .map_err(|_| WalError::CorruptRecord {
+                    lsn: INVALID_LSN,
+                    reason: "failed to read LSN field".to_string(),
+                })?,
+        );
+        let prev_lsn = u64::from_le_bytes(
+            bytes[12..20]
+                .try_into()
+                .map_err(|_| WalError::CorruptRecord {
+                    lsn,
+                    reason: "failed to read prev_lsn field".to_string(),
+                })?,
+        );
+        let xid = u32::from_le_bytes(
+            bytes[20..24]
+                .try_into()
+                .map_err(|_| WalError::CorruptRecord {
+                    lsn,
+                    reason: "failed to read xid field".to_string(),
+                })?,
+        );
         let record_type = WalRecordType::try_from(bytes[24])?;
-        let page_no = u32::from_le_bytes(bytes[25..29].try_into().unwrap());
-        let data_len = u32::from_le_bytes(bytes[29..33].try_into().unwrap()) as usize;
+        let page_no = u32::from_le_bytes(
+            bytes[25..29]
+                .try_into()
+                .map_err(|_| WalError::CorruptRecord {
+                    lsn,
+                    reason: "failed to read page_no field".to_string(),
+                })?,
+        );
+        let data_len = u32::from_le_bytes(
+            bytes[29..33]
+                .try_into()
+                .map_err(|_| WalError::CorruptRecord {
+                    lsn,
+                    reason: "failed to read data_len field".to_string(),
+                })?,
+        ) as usize;
 
         if crc_offset < FIXED_HEADER_LEN + data_len {
             return Err(WalError::CorruptRecord {

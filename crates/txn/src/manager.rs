@@ -154,11 +154,10 @@ impl TransactionManager {
         Ok(())
     }
 
-    /// Check for serializable conflicts using rw-antidependency cycle detection.
+    /// Check for serializable conflicts using full rw-antidependency cycle detection.
     ///
-    /// Implements simplified Thomas-Ports SSI:
-    /// For committing txn T, find concurrent txns T2 that read data T wrote,
-    /// then check if T2 also wrote data T read — forming a cycle T→T2→T.
+    /// Builds a directed dependency graph from all active Serializable transactions
+    /// and runs DFS from the committing xid to detect any cycle.
     fn check_serializable_conflict(&self, xid: Xid) -> Result<(), TxnError> {
         let inner = self.inner.lock();
         let txn = match inner.active.get(&xid) {
@@ -181,34 +180,36 @@ impl TransactionManager {
             return Ok(());
         }
 
-        let t_write_set: HashSet<(u32, u16)> = txn.write_set.clone();
-        let t_read_set: HashSet<(u32, u16)> = txn.read_set.clone();
+        // Collect all active Serializable transactions (including committing xid)
+        let ser_txns: Vec<Xid> = inner
+            .active
+            .iter()
+            .filter(|(_, t)| t.isolation == IsolationLevel::Serializable)
+            .map(|(x, _)| *x)
+            .collect();
 
-        // For each concurrent Serializable transaction T2 (not yet committed, not aborted)
-        for (other_xid, other_txn) in &inner.active {
-            if *other_xid == xid {
-                continue;
-            }
-            if other_txn.isolation != IsolationLevel::Serializable {
-                continue;
-            }
+        // Build rw-antidependency graph: edge A→B means B wrote something A read
+        let mut edges: HashMap<Xid, Vec<Xid>> = HashMap::new();
 
-            // Check: T2 read something that T wrote (T2 →rw→ T antidependency)
-            let t2_read_t_write = other_txn.read_set.intersection(&t_write_set).next().is_some();
-
-            if t2_read_t_write {
-                // Check: T wrote something T2 also wrote (T →rw→ T2 antidependency)
-                // (T read data that T2 is writing)
-                let t_read_t2_write = t_read_set.intersection(&other_txn.write_set).next().is_some();
-
-                if t_read_t2_write {
-                    log::warn!(
-                        "SSI: cycle detected — xid={} and xid={} form a dangerous structure",
-                        xid, other_xid
-                    );
-                    return Err(TxnError::SerializationFailure);
+        for i in 0..ser_txns.len() {
+            for j in 0..ser_txns.len() {
+                if i == j {
+                    continue;
+                }
+                let a = ser_txns[i];
+                let b = ser_txns[j];
+                let txn_a = &inner.active[&a];
+                let txn_b = &inner.active[&b];
+                // Edge A→B: B wrote something A read
+                if txn_a.read_set.intersection(&txn_b.write_set).next().is_some() {
+                    edges.entry(a).or_default().push(b);
                 }
             }
+        }
+
+        if has_cycle(xid, &edges) {
+            log::warn!("SSI: cycle detected involving xid={}", xid);
+            return Err(TxnError::SerializationFailure);
         }
 
         Ok(())
@@ -565,6 +566,38 @@ impl TransactionManager {
             }
         }
     }
+}
+
+/// Check whether the dependency graph contains any cycle reachable from `start`.
+fn has_cycle(start: Xid, edges: &HashMap<Xid, Vec<Xid>>) -> bool {
+    let mut visited = HashSet::new();
+    let mut path = HashSet::new();
+    dfs(start, edges, &mut visited, &mut path)
+}
+
+fn dfs(
+    node: Xid,
+    edges: &HashMap<Xid, Vec<Xid>>,
+    visited: &mut HashSet<Xid>,
+    path: &mut HashSet<Xid>,
+) -> bool {
+    if path.contains(&node) {
+        return true;
+    }
+    if visited.contains(&node) {
+        return false;
+    }
+    visited.insert(node);
+    path.insert(node);
+    if let Some(neighbors) = edges.get(&node) {
+        for &next in neighbors {
+            if dfs(next, edges, visited, path) {
+                return true;
+            }
+        }
+    }
+    path.remove(&node);
+    false
 }
 
 /// Overwrite the header bytes of an existing tuple slot in a page.

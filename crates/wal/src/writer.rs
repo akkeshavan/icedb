@@ -111,7 +111,9 @@ impl WalWriter {
             // Scan through all segments in order; scan the last one in full to
             // find the highest LSN.
             segments.sort_unstable();
-            let last_seg = *segments.last().unwrap();
+            let last_seg = *segments
+                .last()
+                .expect("segments is non-empty; checked above");
 
             // Scan all segments to find the highest LSN.
             let (max_lsn, prev_lsn) = Self::scan_segments(log_dir, &segments)?;

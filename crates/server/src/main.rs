@@ -7,13 +7,16 @@ use std::sync::Arc;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
-    // Parse args: --port PORT --data-dir DIR [--tls-cert PATH --tls-key PATH]
+    // Parse args: --port PORT --data-dir DIR [--shared-buffers N] [--tls-cert PATH --tls-key PATH]
     let args: Vec<String> = std::env::args().collect();
     let port = parse_arg(&args, "--port").unwrap_or("5432".to_string());
     let data_dir = parse_arg(&args, "--data-dir").unwrap_or("./data".to_string());
     let data_dir = PathBuf::from(&data_dir);
     let tls_cert = parse_arg(&args, "--tls-cert");
     let tls_key = parse_arg(&args, "--tls-key");
+    let shared_buffers: usize = parse_arg(&args, "--shared-buffers")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1024);
 
     std::fs::create_dir_all(&data_dir)?;
 
@@ -21,6 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!("Starting icedb server at {}", addr);
     log::info!("Data directory: {}", data_dir.display());
+    log::info!("shared_buffers = {} frames", shared_buffers);
 
     // Initialize the default "icedb" database engine
     let wal_writer = Arc::new(wal::WalWriter::open(&data_dir)?);

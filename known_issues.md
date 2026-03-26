@@ -62,14 +62,22 @@ All previously listed critical issues have been resolved.
 
 ## Production Reliability / Security
 
-| # | Issue |
-|---|-------|
-| 22 | **OOM-safe buffer pool** — buffer pool can grow without bound under load; no fixed allocation ceiling |
-| 23 | **Connection limit enforcement** — no max-connections cap; server accepts unlimited clients |
-| 24 | **Graceful `SIGTERM` shutdown** — no signal handler; process exits abruptly, may corrupt in-flight writes |
-| 25 | **`unwrap()` audit** — 1,171+ `unwrap()` calls workspace-wide; any unexpected state panics the thread |
-| 26 | **Deadlock detection / timeout** — two-phase locking implemented but no deadlock detector; waiting transactions can hang forever |
-| 27 | **SSI cycle detection** — SSI rw-antidependency tracking code exists but cycle detection is incomplete |
+### Already Resolved (discovered during audit)
+
+| # | Issue | Status |
+|---|-------|--------|
+| 23 | **Connection limit enforcement** | ✅ Already implemented — `network/src/server.rs` enforces `DEFAULT_MAX_CONNECTIONS = 100`; excess connections are rejected at accept time |
+| 24 | **Graceful `SIGTERM` shutdown** | ✅ Already implemented — `server.rs` installs a SIGTERM + Ctrl-C handler; accept loop drains with a 30-second timeout before process exit |
+
+### Resolved
+
+| # | Issue | Status |
+|---|-------|--------|
+| 22 | **OOM-safe buffer pool** | ✅ Fixed — `MAX_BUFFER_FRAMES = 131_072` (1 GB) constant added; `BufferPool::new` silently caps `num_frames`; `--shared-buffers N` flag added to server (default 1024 frames) |
+| 25 | **`unwrap()` audit — critical paths** | ✅ Fixed — WAL `decode()` hot path: all 7 `try_into().unwrap()` replaced with `map_err(|_| WalError::CorruptRecord {...})?`; WAL `writer.rs`: `unwrap()` on `segments.last()` replaced with `expect()` with message; network handler had no dangerous unwraps |
+
+| 26 | **Deadlock detection** | ✅ Fixed — `LockState` struct holds `write_locks` + `wait_for` graph under one `Mutex`; `acquire_write_lock` records the dependency, walks the chain, and returns `TxnError::Deadlock` if a cycle is found |
+| 27 | **SSI cycle detection** | ✅ Fixed — `check_serializable_conflict` now builds a full rw-antidependency graph from all active Serializable txns and runs DFS (`has_cycle` + `dfs`) to detect multi-hop cycles, not just 2-hop ones |
 
 ---
 
