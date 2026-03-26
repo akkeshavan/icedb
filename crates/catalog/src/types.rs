@@ -14,6 +14,9 @@ pub enum DataType {
     TimestampTz,    // same as Timestamp, stored as UTC i64
     Numeric,        // exact decimal as string
     Uuid,           // UUID string
+    Array(Box<DataType>), // e.g. INT[], TEXT[]
+    Json,                 // JSON text
+    Jsonb,                // Binary JSON (stored same as JSON internally)
 }
 
 impl DataType {
@@ -31,6 +34,9 @@ impl DataType {
             DataType::TimestampTz => OID_TYPE_TIMESTAMPTZ,
             DataType::Numeric => OID_TYPE_NUMERIC,
             DataType::Uuid => OID_TYPE_UUID,
+            DataType::Array(_) => 2277, // anyarray
+            DataType::Json => 114,
+            DataType::Jsonb => 3802,
         }
     }
 
@@ -66,7 +72,12 @@ impl DataType {
     pub fn is_variable_length(&self) -> bool {
         matches!(
             self,
-            DataType::Text | DataType::VarChar(_) | DataType::Bytea
+            DataType::Text
+                | DataType::VarChar(_)
+                | DataType::Bytea
+                | DataType::Array(_)
+                | DataType::Json
+                | DataType::Jsonb
         )
     }
 
@@ -83,23 +94,29 @@ impl DataType {
             DataType::Bytea => None,
             DataType::Numeric => None,
             DataType::Uuid => None,
+            DataType::Array(_) => None,
+            DataType::Json => None,
+            DataType::Jsonb => None,
         }
     }
 
-    pub fn type_name(&self) -> &'static str {
+    pub fn type_name(&self) -> String {
         match self {
-            DataType::Boolean => "boolean",
-            DataType::Int4 => "integer",
-            DataType::Int8 => "bigint",
-            DataType::Float8 => "double precision",
-            DataType::Text => "text",
-            DataType::VarChar(_) => "character varying",
-            DataType::Bytea => "bytea",
-            DataType::Date => "date",
-            DataType::Timestamp => "timestamp without time zone",
-            DataType::TimestampTz => "timestamp with time zone",
-            DataType::Numeric => "numeric",
-            DataType::Uuid => "uuid",
+            DataType::Boolean => "boolean".to_string(),
+            DataType::Int4 => "integer".to_string(),
+            DataType::Int8 => "bigint".to_string(),
+            DataType::Float8 => "double precision".to_string(),
+            DataType::Text => "text".to_string(),
+            DataType::VarChar(_) => "character varying".to_string(),
+            DataType::Bytea => "bytea".to_string(),
+            DataType::Date => "date".to_string(),
+            DataType::Timestamp => "timestamp without time zone".to_string(),
+            DataType::TimestampTz => "timestamp with time zone".to_string(),
+            DataType::Numeric => "numeric".to_string(),
+            DataType::Uuid => "uuid".to_string(),
+            DataType::Array(inner) => format!("{}[]", inner.type_name()),
+            DataType::Json => "json".to_string(),
+            DataType::Jsonb => "jsonb".to_string(),
         }
     }
 

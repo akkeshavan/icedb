@@ -1435,11 +1435,14 @@ fn test_array_agg_aggregate() {
     let result = engine.execute("SELECT array_agg(n) FROM nums").unwrap();
     assert_eq!(result.rows.len(), 1);
     match result.rows[0].get_by_idx(0) {
+        Some(Value::Array(v)) => {
+            assert_eq!(v.len(), 3, "expected 3 elements in array_agg result, got {:?}", v);
+        }
+        // Also accept Text (legacy format for backward compat)
         Some(Value::Text(s)) => {
-            // Expected format: {1,2,3}
             assert!(s.starts_with('{') && s.ends_with('}'), "unexpected array_agg format: {}", s);
         }
-        other => panic!("expected Text array format, got {:?}", other),
+        other => panic!("expected Array from array_agg, got {:?}", other),
     }
 }
 

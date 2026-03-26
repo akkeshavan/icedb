@@ -29,3 +29,4 @@ pub mod string_functions;
 pub mod date_type;
 pub mod timestamp_type;
 pub mod limit_offset;
+pub mod array_json;

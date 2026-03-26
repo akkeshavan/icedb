@@ -49,7 +49,9 @@ pub async fn run_query(
                             sql::Value::Date(_)
                             | sql::Value::Timestamp(_)
                             | sql::Value::Numeric(_)
-                            | sql::Value::Uuid(_) => {
+                            | sql::Value::Uuid(_)
+                            | sql::Value::Array(_)
+                            | sql::Value::Json(_) => {
                                 json!(v.to_string())
                             }
                         })

@@ -2727,22 +2727,27 @@ impl Executor {
                     if any { Value::Bool(result) } else { Value::Null }
                 }
                 AggFunc::ArrayAgg => {
-                    // Collect all values as text joined with comma (simplified)
-                    let mut parts: Vec<String> = Vec::new();
+                    // Collect all non-null values into a Value::Array
+                    let mut collected: Vec<Value> = Vec::new();
                     for row in rows {
                         let v = self.eval_expr(expr, row)?;
                         if !matches!(v, Value::Null) {
-                            parts.push(v.to_string());
+                            collected.push(v);
                         }
                     }
-                    Value::Text(format!("{{{}}}", parts.join(",")))
+                    Value::Array(collected)
                 }
             };
             let dtype = match func {
                 AggFunc::Count | AggFunc::CountDistinct => catalog::DataType::Int8,
                 AggFunc::BoolAnd | AggFunc::BoolOr => catalog::DataType::Boolean,
                 AggFunc::Avg | AggFunc::Stddev | AggFunc::StddevPop | AggFunc::Variance | AggFunc::VarPop => catalog::DataType::Float8,
-                AggFunc::StringAgg { .. } | AggFunc::ArrayAgg => catalog::DataType::Text,
+                AggFunc::StringAgg { .. } => catalog::DataType::Text,
+                AggFunc::ArrayAgg => {
+                    let input_schema = rows.first().map(|r| r.schema.as_slice()).unwrap_or(&[]);
+                    let inner = infer_expr_type(expr, input_schema);
+                    catalog::DataType::Array(Box::new(inner))
+                }
                 AggFunc::Sum | AggFunc::Min | AggFunc::Max => {
                     // Infer from the expression type using the first row's schema,
                     // or fallback to Text if no rows.
@@ -3565,13 +3570,217 @@ impl Executor {
                 let v = self.eval_expr(&args[0], row)?;
                 v.cast_to(&catalog::DataType::Text)
             }
-            "array_length" => {
-                // Not really supported but return null
+            "__array_subscript__" => {
+                // Internal: arr[idx] — PostgreSQL arrays are 1-indexed
+                let arr_val = self.eval_expr(&args[0], row)?;
+                let idx_val = self.eval_expr(&args[1], row)?;
+                let idx = match idx_val {
+                    Value::Int4(i) => i as usize,
+                    Value::Int8(i) => i as usize,
+                    _ => return Ok(Value::Null),
+                };
+                match arr_val {
+                    Value::Array(v) => {
+                        // 1-indexed
+                        if idx >= 1 && idx <= v.len() {
+                            Ok(v[idx - 1].clone())
+                        } else {
+                            Ok(Value::Null)
+                        }
+                    }
+                    _ => Ok(Value::Null),
+                }
+            }
+            "array_length" | "array_upper" => {
+                // array_length(arr, dim) — dim always 1
+                let arr_val = self.eval_expr(&args[0], row)?;
+                match arr_val {
+                    Value::Array(v) => Ok(Value::Int4(v.len() as i32)),
+                    Value::Text(s) if s.starts_with('{') => {
+                        // Parse PostgreSQL array literal {a,b,c}
+                        let inner = s.trim_matches('{').trim_matches('}');
+                        let count = if inner.is_empty() { 0 } else { inner.split(',').count() };
+                        Ok(Value::Int4(count as i32))
+                    }
+                    _ => Ok(Value::Null),
+                }
+            }
+            "array_lower" => Ok(Value::Int4(1)), // arrays are 1-indexed in PG
+            "unnest" => {
+                // unnest is a set-returning function; in scalar context return Null
                 Ok(Value::Null)
             }
-            "unnest" => {
-                // Not supported in scalar context
-                Ok(Value::Null)
+            "array_cat" => {
+                let a_val = self.eval_expr(&args[0], row)?;
+                let b_val = self.eval_expr(&args[1], row)?;
+                match (a_val, b_val) {
+                    (Value::Array(a), Value::Array(b)) => {
+                        let mut result = a;
+                        result.extend(b);
+                        Ok(Value::Array(result))
+                    }
+                    _ => Ok(Value::Null),
+                }
+            }
+            "array_append" => {
+                let arr_val = self.eval_expr(&args[0], row)?;
+                let elem_val = self.eval_expr(&args[1], row)?;
+                match arr_val {
+                    Value::Array(mut v) => {
+                        v.push(elem_val);
+                        Ok(Value::Array(v))
+                    }
+                    _ => Ok(Value::Null),
+                }
+            }
+            "array_prepend" => {
+                let elem_val = self.eval_expr(&args[0], row)?;
+                let arr_val = self.eval_expr(&args[1], row)?;
+                match arr_val {
+                    Value::Array(v) => {
+                        let mut result = vec![elem_val];
+                        result.extend(v);
+                        Ok(Value::Array(result))
+                    }
+                    _ => Ok(Value::Null),
+                }
+            }
+            "array_to_string" => {
+                let arr_val = self.eval_expr(&args[0], row)?;
+                let sep_val = if args.len() > 1 { self.eval_expr(&args[1], row)? } else { Value::Text(",".to_string()) };
+                let sep = match &sep_val {
+                    Value::Text(s) => s.clone(),
+                    _ => ",".to_string(),
+                };
+                match arr_val {
+                    Value::Array(v) => {
+                        let s = v.iter().filter(|x| !matches!(x, Value::Null)).map(|x| x.to_string()).collect::<Vec<_>>().join(&sep);
+                        Ok(Value::Text(s))
+                    }
+                    _ => Ok(Value::Null),
+                }
+            }
+            "string_to_array" => {
+                let s_val = self.eval_expr(&args[0], row)?;
+                let sep_val = self.eval_expr(&args[1], row)?;
+                match (s_val, sep_val) {
+                    (Value::Text(s), Value::Text(sep)) => {
+                        let parts: Vec<Value> = s.split(sep.as_str()).map(|p| Value::Text(p.to_string())).collect();
+                        Ok(Value::Array(parts))
+                    }
+                    _ => Ok(Value::Null),
+                }
+            }
+            // ── JSON functions ─────────────────────────────────────────────────
+            "json_extract_path" | "jsonb_extract_path" => {
+                if args.is_empty() { return Ok(Value::Null); }
+                let json_str = match self.eval_expr(&args[0], row)? {
+                    Value::Json(s) | Value::Text(s) => s,
+                    _ => return Ok(Value::Null),
+                };
+                let mut val: serde_json::Value = serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null);
+                for key_expr in &args[1..] {
+                    let k = match self.eval_expr(key_expr, row)? {
+                        Value::Text(s) => s,
+                        _ => break,
+                    };
+                    val = val.get(k.as_str()).cloned().unwrap_or(serde_json::Value::Null);
+                }
+                match val {
+                    serde_json::Value::Null => Ok(Value::Null),
+                    other => Ok(Value::Json(other.to_string())),
+                }
+            }
+            "json_extract_path_text" | "jsonb_extract_path_text" => {
+                if args.is_empty() { return Ok(Value::Null); }
+                let json_str = match self.eval_expr(&args[0], row)? {
+                    Value::Json(s) | Value::Text(s) => s,
+                    _ => return Ok(Value::Null),
+                };
+                let mut val: serde_json::Value = serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null);
+                for key_expr in &args[1..] {
+                    let k = match self.eval_expr(key_expr, row)? {
+                        Value::Text(s) => s,
+                        _ => break,
+                    };
+                    val = val.get(k.as_str()).cloned().unwrap_or(serde_json::Value::Null);
+                }
+                match val {
+                    serde_json::Value::Null => Ok(Value::Null),
+                    serde_json::Value::String(s) => Ok(Value::Text(s)),
+                    other => Ok(Value::Text(other.to_string())),
+                }
+            }
+            "json_array_length" | "jsonb_array_length" => {
+                let json_val = self.eval_expr(&args[0], row)?;
+                let s = match json_val {
+                    Value::Json(s) | Value::Text(s) => s,
+                    _ => return Ok(Value::Null),
+                };
+                let v: serde_json::Value = serde_json::from_str(&s).unwrap_or(serde_json::Value::Null);
+                match v.as_array() {
+                    Some(arr) => Ok(Value::Int4(arr.len() as i32)),
+                    None => Ok(Value::Null),
+                }
+            }
+            "json_build_object" | "jsonb_build_object" => {
+                let mut map = serde_json::Map::new();
+                let mut i = 0;
+                while i + 1 < args.len() {
+                    let k_val = self.eval_expr(&args[i], row)?;
+                    let v_val = self.eval_expr(&args[i + 1], row)?;
+                    if let Value::Text(key) = k_val {
+                        map.insert(key, crate::value::value_to_json_value(&v_val));
+                    }
+                    i += 2;
+                }
+                Ok(Value::Json(serde_json::Value::Object(map).to_string()))
+            }
+            "json_build_array" | "jsonb_build_array" => {
+                let arr: Result<Vec<serde_json::Value>, _> = args.iter()
+                    .map(|a| self.eval_expr(a, row).map(|v| crate::value::value_to_json_value(&v)))
+                    .collect();
+                Ok(Value::Json(serde_json::Value::Array(arr?).to_string()))
+            }
+            "to_json" | "to_jsonb" | "row_to_json" => {
+                let v = self.eval_expr(&args[0], row)?;
+                Ok(Value::Json(crate::value::value_to_json_value(&v).to_string()))
+            }
+            "json_typeof" | "jsonb_typeof" => {
+                let json_val = self.eval_expr(&args[0], row)?;
+                let s = match json_val {
+                    Value::Json(s) | Value::Text(s) => s,
+                    _ => return Ok(Value::Null),
+                };
+                let v: serde_json::Value = serde_json::from_str(&s).unwrap_or(serde_json::Value::Null);
+                let t = match &v {
+                    serde_json::Value::Object(_) => "object",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::Bool(_) => "boolean",
+                    serde_json::Value::Null => "null",
+                };
+                Ok(Value::Text(t.to_string()))
+            }
+            "json_object" | "jsonb_object" => {
+                // json_object(keys TEXT[], values TEXT[]) → JSON
+                if args.len() >= 2 {
+                    let keys_val = self.eval_expr(&args[0], row)?;
+                    let vals_val = self.eval_expr(&args[1], row)?;
+                    match (keys_val, vals_val) {
+                        (Value::Array(keys), Value::Array(vals)) => {
+                            let mut map = serde_json::Map::new();
+                            for (k, v) in keys.iter().zip(vals.iter()) {
+                                map.insert(k.to_string(), crate::value::value_to_json_value(v));
+                            }
+                            Ok(Value::Json(serde_json::Value::Object(map).to_string()))
+                        }
+                        _ => Ok(Value::Null),
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
             }
             // ── System information functions ───────────────────────────────────
             "current_user" | "user" | "session_user" => {
@@ -3821,6 +4030,43 @@ impl Executor {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                 _ => Err(SqlError::Execution("modulo requires integer operands".to_string())),
             },
+            BinaryOp::JsonGet => {
+                let json_str = match &left {
+                    Value::Json(s) | Value::Text(s) => s.clone(),
+                    _ => return Ok(Value::Null),
+                };
+                let v: serde_json::Value = serde_json::from_str(&json_str)
+                    .unwrap_or(serde_json::Value::Null);
+                let result = match &right {
+                    Value::Text(key) => v.get(key.as_str()).cloned().unwrap_or(serde_json::Value::Null),
+                    Value::Int4(idx) => v.get(*idx as usize).cloned().unwrap_or(serde_json::Value::Null),
+                    Value::Int8(idx) => v.get(*idx as usize).cloned().unwrap_or(serde_json::Value::Null),
+                    _ => serde_json::Value::Null,
+                };
+                match result {
+                    serde_json::Value::Null => Ok(Value::Null),
+                    other => Ok(Value::Json(other.to_string())),
+                }
+            }
+            BinaryOp::JsonGetText => {
+                let json_str = match &left {
+                    Value::Json(s) | Value::Text(s) => s.clone(),
+                    _ => return Ok(Value::Null),
+                };
+                let v: serde_json::Value = serde_json::from_str(&json_str)
+                    .unwrap_or(serde_json::Value::Null);
+                let result = match &right {
+                    Value::Text(key) => v.get(key.as_str()).cloned().unwrap_or(serde_json::Value::Null),
+                    Value::Int4(idx) => v.get(*idx as usize).cloned().unwrap_or(serde_json::Value::Null),
+                    Value::Int8(idx) => v.get(*idx as usize).cloned().unwrap_or(serde_json::Value::Null),
+                    _ => serde_json::Value::Null,
+                };
+                match result {
+                    serde_json::Value::Null => Ok(Value::Null),
+                    serde_json::Value::String(s) => Ok(Value::Text(s)),
+                    other => Ok(Value::Text(other.to_string())),
+                }
+            }
         }
     }
 
@@ -5792,6 +6038,8 @@ fn value_to_sql_literal(val: &Value) -> String {
         Value::Date(d) => format!("'{}'", d),
         Value::Timestamp(t) => format!("'{}'", t),
         Value::Bytes(_) => "NULL".to_string(),
+        Value::Array(_) => format!("'{}'", val.to_string().replace('\'', "''")),
+        Value::Json(s) => format!("'{}'", s.replace('\'', "''")),
     }
 }
 
@@ -6103,6 +6351,15 @@ fn infer_expr_type(expr: &Expr, input_schema: &[(String, catalog::DataType)]) ->
             Value::Timestamp(_) => catalog::DataType::Timestamp,
             Value::Numeric(_) => catalog::DataType::Numeric,
             Value::Uuid(_) => catalog::DataType::Uuid,
+            Value::Array(elems) => {
+                let inner = if elems.is_empty() {
+                    catalog::DataType::Text
+                } else {
+                    elems[0].data_type().unwrap_or(catalog::DataType::Text)
+                };
+                catalog::DataType::Array(Box::new(inner))
+            }
+            Value::Json(_) => catalog::DataType::Json,
         },
         Expr::BinaryOp { op, left, .. } => match op {
             BinaryOp::Eq
@@ -6117,6 +6374,8 @@ fn infer_expr_type(expr: &Expr, input_schema: &[(String, catalog::DataType)]) ->
                 infer_expr_type(left, input_schema)
             }
             BinaryOp::Concat => catalog::DataType::Text,
+            BinaryOp::JsonGet => catalog::DataType::Json,
+            BinaryOp::JsonGetText => catalog::DataType::Text,
         },
         Expr::UnaryOp { expr, .. } => infer_expr_type(expr, input_schema),
         Expr::Cast { data_type, .. } => data_type.clone(),
@@ -6210,6 +6469,17 @@ impl std::hash::Hash for OrderableValue {
                 9u8.hash(state);
                 s.hash(state);
             }
+            Value::Array(arr) => {
+                10u8.hash(state);
+                // Hash each element by its string representation
+                for elem in arr {
+                    elem.to_string().hash(state);
+                }
+            }
+            Value::Json(s) => {
+                11u8.hash(state);
+                s.hash(state);
+            }
         }
     }
 }
@@ -6245,21 +6515,8 @@ fn random_f64() -> f64 {
     (x as f64) / (u32::MAX as f64)
 }
 
-fn datatype_name(dt: &catalog::DataType) -> &'static str {
-    match dt {
-        catalog::DataType::Boolean => "boolean",
-        catalog::DataType::Int4 => "integer",
-        catalog::DataType::Int8 => "bigint",
-        catalog::DataType::Float8 => "double precision",
-        catalog::DataType::Text => "text",
-        catalog::DataType::VarChar(_) => "character varying",
-        catalog::DataType::Bytea => "bytea",
-        catalog::DataType::Date => "date",
-        catalog::DataType::Timestamp => "timestamp without time zone",
-        catalog::DataType::TimestampTz => "timestamp with time zone",
-        catalog::DataType::Numeric => "numeric",
-        catalog::DataType::Uuid => "uuid",
-    }
+fn datatype_name(dt: &catalog::DataType) -> String {
+    dt.type_name()
 }
 
 /// Derive a display name for a single expression (used by plan_col_names).

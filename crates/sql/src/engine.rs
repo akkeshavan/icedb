@@ -835,6 +835,8 @@ fn value_to_sql_literal(val: &Value) -> String {
         Value::Date(d) => format!("'{}'", d),
         Value::Timestamp(t) => format!("'{}'", t),
         Value::Bytes(_) => "NULL".to_string(),
+        Value::Array(_) => format!("'{}'", val.to_string().replace('\'', "''")),
+        Value::Json(s) => format!("'{}'", s.replace('\'', "''")),
     }
 }
 
@@ -853,6 +855,9 @@ fn schema_to_create_table_sql(schema: &catalog::schema::TableSchema, table_name:
             catalog::DataType::TimestampTz => "TIMESTAMPTZ",
             catalog::DataType::Numeric => "NUMERIC",
             catalog::DataType::Uuid => "UUID",
+            catalog::DataType::Array(_) => "TEXT[]",
+            catalog::DataType::Json => "JSON",
+            catalog::DataType::Jsonb => "JSONB",
         };
         let null_str = if col.not_null { " NOT NULL" } else { "" };
         format!("    {} {}{}", col.name, type_str, null_str)
