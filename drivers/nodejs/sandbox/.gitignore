@@ -1,0 +1,11 @@
+# Node
+node_modules/
+npm-debug.log*
+
+# napi build output
+*.node
+build/
+dist/
+
+# test data
+test_data/

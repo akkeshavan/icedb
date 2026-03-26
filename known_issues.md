@@ -3,7 +3,7 @@
 **Last updated**: 2026-03-26
 **Test baseline**: 313 unit + 761 integration = 1,074 passing, 0 ignored, 0 failing
 
-> CLI issues 18–21 resolved in the same session (see CLI / Tooling section below).
+> CLI issues 18–21, Production Reliability issues 22–27, Testing issues 28–30, and Driver issues 33–35 resolved (see sections below). Issues 31–32 require external tools; issues 14 (Triggers) remains open.
 
 ---
 
@@ -100,10 +100,12 @@ All previously listed critical issues have been resolved.
 
 ---
 
-## Drivers (Phase 9 — All Stubs)
+## Drivers (Phase 9)
 
-| # | Issue |
-|---|-------|
-| 33 | **Rust async driver** — stub only; no connection pool, no Arrow output |
-| 34 | **Python driver (PyO3/Maturin)** — stub only |
-| 35 | **Node.js driver (NAPI-RS)** — stub only |
+### Resolved
+
+| # | Issue | Status |
+|---|-------|--------|
+| 33 | **Rust async driver** | ✅ Fixed — `AsyncConnection` with `tokio::task::spawn_blocking`; `rows_to_record_batch()` Arrow output; `drivers/rust/sandbox/` with install/test scripts; all 18 driver tests + sandbox pass |
+| 34 | **Python driver (PyO3/Maturin)** | ✅ Fixed — `begin()`/`commit()`/`rollback()` + `__enter__`/`__exit__` context manager; full type mapping (Array, Json, Date, Timestamp, Numeric, Uuid); session-based execution; `drivers/python/sandbox/` with install/test scripts |
+| 35 | **Node.js driver (NAPI-RS)** | ✅ Fixed — `begin()`/`commit()`/`rollback()` transaction methods; session-based execution; `drivers/nodejs/sandbox/` with install/test scripts |

@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::sync::Arc;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Python wrapper for a single SQL row
 #[pyclass]
@@ -39,17 +40,21 @@ impl PyRow {
     }
 }
 
+static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 /// Python wrapper for the icedb engine
 #[pyclass]
 pub struct PyConnection {
     engine: Arc<sql::engine::QueryEngine>,
+    session_id: String,
+    in_transaction: bool,
 }
 
 #[pymethods]
 impl PyConnection {
     /// Execute a SQL statement and return a list of rows.
     pub fn execute(&self, py: Python<'_>, sql: &str) -> PyResult<Vec<PyRow>> {
-        let result = self.engine.execute(sql)
+        let result = self.engine.execute_session(&self.session_id, sql)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         let rows = result.rows.into_iter().map(|row| {
@@ -67,9 +72,60 @@ impl PyConnection {
 
     /// Execute a SQL statement and return the number of affected rows.
     pub fn execute_dml(&self, sql: &str) -> PyResult<u64> {
-        let result = self.engine.execute(sql)
+        let result = self.engine.execute_session(&self.session_id, sql)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(result.rows_affected)
+    }
+
+    /// Begin a transaction.
+    pub fn begin(&mut self) -> PyResult<()> {
+        self.engine.execute_session(&self.session_id, "BEGIN")
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        self.in_transaction = true;
+        Ok(())
+    }
+
+    /// Commit the current transaction.
+    pub fn commit(&mut self) -> PyResult<()> {
+        self.engine.execute_session(&self.session_id, "COMMIT")
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        self.in_transaction = false;
+        Ok(())
+    }
+
+    /// Rollback the current transaction.
+    pub fn rollback(&mut self) -> PyResult<()> {
+        self.engine.execute_session(&self.session_id, "ROLLBACK")
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        self.in_transaction = false;
+        Ok(())
+    }
+
+    /// Context manager entry — begins a transaction.
+    pub fn __enter__(mut slf: PyRefMut<'_, Self>) -> PyResult<PyRefMut<'_, Self>> {
+        slf.engine.execute_session(&slf.session_id.clone(), "BEGIN")
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        slf.in_transaction = true;
+        Ok(slf)
+    }
+
+    /// Context manager exit — commits on success, rolls back on exception.
+    pub fn __exit__(
+        &mut self,
+        exc_type: Option<&Bound<'_, pyo3::types::PyAny>>,
+        _exc_val: Option<&Bound<'_, pyo3::types::PyAny>>,
+        _exc_tb: Option<&Bound<'_, pyo3::types::PyAny>>,
+    ) -> PyResult<bool> {
+        if exc_type.is_some() {
+            let _ = self.engine.execute_session(&self.session_id, "ROLLBACK");
+            self.in_transaction = false;
+            Ok(false) // re-raise the exception
+        } else {
+            self.engine.execute_session(&self.session_id, "COMMIT")
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            self.in_transaction = false;
+            Ok(false)
+        }
     }
 }
 
@@ -82,6 +138,15 @@ fn value_to_python(py: Python<'_>, value: &sql::value::Value) -> PyObject {
         sql::value::Value::Float8(f) => f.into_py(py),
         sql::value::Value::Text(s) => s.into_py(py),
         sql::value::Value::Bytes(b) => pyo3::types::PyBytes::new_bound(py, b).into(),
+        sql::value::Value::Date(d) => d.into_py(py),
+        sql::value::Value::Timestamp(ts) => ts.into_py(py),
+        sql::value::Value::Numeric(s) => s.into_py(py),
+        sql::value::Value::Uuid(s) => s.into_py(py),
+        sql::value::Value::Array(items) => {
+            let list = PyList::new_bound(py, items.iter().map(|v| value_to_python(py, v)));
+            list.into()
+        }
+        sql::value::Value::Json(j) => j.to_string().into_py(py),
     }
 }
 
@@ -99,7 +164,8 @@ pub fn connect(data_dir: &str) -> PyResult<PyConnection> {
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?);
     let engine = Arc::new(sql::QueryEngine::new(txn_manager, catalog, data_dir));
 
-    Ok(PyConnection { engine })
+    let session_id = format!("py-session-{}", SESSION_COUNTER.fetch_add(1, Ordering::Relaxed));
+    Ok(PyConnection { engine, session_id, in_transaction: false })
 }
 
 /// Python module definition

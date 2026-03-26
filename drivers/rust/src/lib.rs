@@ -1,6 +1,8 @@
 pub mod error;
 pub mod connection;
 pub mod pool;
+pub mod async_connection;
+pub mod arrow_output;
 
 #[cfg(test)]
 mod tests;
@@ -8,6 +10,8 @@ mod tests;
 pub use error::DriverError;
 pub use connection::Connection;
 pub use pool::{ConnectionPool, PooledConnection};
+pub use async_connection::{AsyncConnection, open_async};
+pub use arrow_output::rows_to_record_batch;
 
 use std::sync::Arc;
 use std::path::Path;

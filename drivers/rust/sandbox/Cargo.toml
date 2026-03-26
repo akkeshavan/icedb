@@ -1,0 +1,12 @@
+[workspace]
+
+[package]
+name = "icedb-rust-sandbox"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+icedb-driver = { path = ".." }
+sql = { path = "../../../crates/sql" }
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"

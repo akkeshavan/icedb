@@ -1,0 +1,12 @@
+{
+  "name": "icedb-nodejs-sandbox",
+  "version": "1.0.0",
+  "description": "Sandbox test program for the icedb Node.js driver",
+  "main": "test_icedb.js",
+  "scripts": {
+    "test": "node test_icedb.js"
+  },
+  "dependencies": {
+    "icedb": "file:../"
+  }
+}
