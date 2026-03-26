@@ -78,6 +78,8 @@ pub enum BinaryOp {
     Div,
     Concat,
     Mod,
+    JsonGet,     // -> (returns JSON)
+    JsonGetText, // ->> (returns text)
 }
 
 #[derive(Debug, Clone)]

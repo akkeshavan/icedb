@@ -2482,6 +2482,33 @@ impl Planner {
             }
             // AstExpr::TryCast does not exist in sqlparser 0.53; TryCast is a CastKind within Cast.
             AstExpr::Nested(inner) => self.convert_expr_with_schema(inner, _schema),
+            // Array subscript: arr[1]
+            AstExpr::Subscript { expr, subscript } => {
+                use sqlparser::ast::Subscript;
+                let arr_expr = self.convert_expr_with_schema(expr, _schema)?;
+                let idx_expr = match subscript.as_ref() {
+                    Subscript::Index { index } => self.convert_expr_with_schema(index, _schema)?,
+                    _ => return Err(SqlError::NotImplemented("array slice subscript".to_string())),
+                };
+                // Emit as a function call to our internal array_subscript helper
+                Ok(Expr::FunctionCall {
+                    name: "__array_subscript__".to_string(),
+                    args: vec![arr_expr, idx_expr],
+                })
+            }
+            // Array literal: ARRAY['foo', 'bar'] or ARRAY[1, 2, 3]
+            AstExpr::Array(arr) => {
+                let vals: Result<Vec<Value>, _> = arr.elem.iter()
+                    .map(|e| {
+                        let expr = self.convert_expr_with_schema(e, _schema)?;
+                        match expr {
+                            Expr::Literal(v) => Ok(v),
+                            _ => Err(SqlError::Execution("Array literal must contain only literals".to_string())),
+                        }
+                    })
+                    .collect();
+                Ok(Expr::Literal(Value::Array(vals?)))
+            }
             AstExpr::Function(func) => {
                 let func_name = func.name.to_string().to_lowercase();
                 // Window functions have an OVER clause — skip them in regular expr conversion;
@@ -2982,6 +3009,24 @@ impl Planner {
             AstDataType::Timestamp(_, _) => Ok(catalog::DataType::Timestamp),
             AstDataType::Uuid => Ok(catalog::DataType::Uuid),
             AstDataType::Numeric(_) | AstDataType::Decimal(_) => Ok(catalog::DataType::Numeric),
+            AstDataType::JSON => Ok(catalog::DataType::Json),
+            AstDataType::JSONB => Ok(catalog::DataType::Jsonb),
+            AstDataType::Array(elem_def) => {
+                use sqlparser::ast::ArrayElemTypeDef;
+                let inner = match elem_def {
+                    ArrayElemTypeDef::SquareBracket(inner_type, _) => {
+                        self.convert_data_type(inner_type)?
+                    }
+                    ArrayElemTypeDef::AngleBracket(inner_type) => {
+                        self.convert_data_type(inner_type)?
+                    }
+                    ArrayElemTypeDef::Parenthesis(inner_type) => {
+                        self.convert_data_type(inner_type)?
+                    }
+                    ArrayElemTypeDef::None => catalog::DataType::Text,
+                };
+                Ok(catalog::DataType::Array(Box::new(inner)))
+            }
             AstDataType::Custom(name, _) => match name.to_string().to_lowercase().as_str() {
                 "int" | "integer" | "int4" => Ok(catalog::DataType::Int4),
                 "bigint" | "int8" => Ok(catalog::DataType::Int8),
@@ -2996,6 +3041,8 @@ impl Planner {
                 "timestamptz" | "timestamp with time zone" => Ok(catalog::DataType::TimestampTz),
                 "numeric" | "decimal" => Ok(catalog::DataType::Numeric),
                 "uuid" => Ok(catalog::DataType::Uuid),
+                "json" => Ok(catalog::DataType::Json),
+                "jsonb" => Ok(catalog::DataType::Jsonb),
                 other => Err(SqlError::TypeError(format!("unknown type: {other}"))),
             },
             _ => Err(SqlError::NotImplemented(format!("data type: {dtype}"))),
@@ -3162,6 +3209,8 @@ fn convert_binary_op(op: &BinaryOperator) -> Result<BinaryOp, SqlError> {
         BinaryOperator::Divide => Ok(BinaryOp::Div),
         BinaryOperator::StringConcat => Ok(BinaryOp::Concat),
         BinaryOperator::Modulo => Ok(BinaryOp::Mod),
+        BinaryOperator::Arrow => Ok(BinaryOp::JsonGet),
+        BinaryOperator::LongArrow => Ok(BinaryOp::JsonGetText),
         _ => Err(SqlError::NotImplemented(format!("binary op: {op}"))),
     }
 }

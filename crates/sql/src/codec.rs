@@ -150,6 +150,22 @@ pub fn decode_row(
                 values.push(v);
                 offset += 4 + len;
             }
+            catalog::DataType::Array(_) | catalog::DataType::Json | catalog::DataType::Jsonb => {
+                if offset + 4 > data.len() {
+                    values.push(Value::Null);
+                    continue;
+                }
+                let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                if offset + 4 + len > data.len() {
+                    return Err(SqlError::Execution(format!(
+                        "data too short for column {} (array/json data)",
+                        col.name
+                    )));
+                }
+                let v = Value::from_bytes(&data[offset..offset + 4 + len], dtype)?;
+                values.push(v);
+                offset += 4 + len;
+            }
         }
     }
 
@@ -217,6 +233,18 @@ pub fn encode_sort_key(value: &Value) -> Vec<u8> {
         }
         Value::Uuid(s) => {
             let mut out = vec![10u8];
+            out.extend_from_slice(s.as_bytes());
+            out
+        }
+        Value::Array(v) => {
+            // Sort by string representation
+            let s = format!("{}", Value::Array(v.clone()));
+            let mut out = vec![11u8];
+            out.extend_from_slice(s.as_bytes());
+            out
+        }
+        Value::Json(s) => {
+            let mut out = vec![12u8];
             out.extend_from_slice(s.as_bytes());
             out
         }

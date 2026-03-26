@@ -45,7 +45,12 @@ pub fn format_value(v: &Value) -> String {
         Value::Float8(f) => format!("{}", f),
         Value::Text(s) => s.clone(),
         Value::Bytes(b) => format!("\\x{}", hex_encode(b)),
-        Value::Date(_) | Value::Timestamp(_) | Value::Numeric(_) | Value::Uuid(_) => {
+        Value::Date(_)
+        | Value::Timestamp(_)
+        | Value::Numeric(_)
+        | Value::Uuid(_)
+        | Value::Array(_)
+        | Value::Json(_) => {
             v.to_string()
         }
     }

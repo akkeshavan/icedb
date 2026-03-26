@@ -17,6 +17,10 @@ pub enum Value {
     Numeric(String),
     /// UUID string
     Uuid(String),
+    /// Array of values
+    Array(Vec<Value>),
+    /// JSON value stored as string
+    Json(String),
 }
 
 impl Value {
@@ -33,6 +37,15 @@ impl Value {
             Value::Timestamp(_) => Some(catalog::DataType::Timestamp),
             Value::Numeric(_) => Some(catalog::DataType::Numeric),
             Value::Uuid(_) => Some(catalog::DataType::Uuid),
+            Value::Array(v) => {
+                let inner = if v.is_empty() {
+                    catalog::DataType::Text
+                } else {
+                    v[0].data_type().unwrap_or(catalog::DataType::Text)
+                };
+                Some(catalog::DataType::Array(Box::new(inner)))
+            }
+            Value::Json(_) => Some(catalog::DataType::Json),
         }
     }
 
@@ -59,6 +72,23 @@ impl Value {
             }
             Value::Date(v) => v.to_le_bytes().to_vec(),
             Value::Timestamp(v) => v.to_le_bytes().to_vec(),
+            Value::Array(v) => {
+                // Serialize as JSON array string with length prefix
+                let json_elems: Vec<serde_json::Value> = v.iter().map(value_to_json_value).collect();
+                let s = serde_json::Value::Array(json_elems).to_string();
+                let bytes = s.as_bytes();
+                let len = bytes.len() as u32;
+                let mut out = len.to_le_bytes().to_vec();
+                out.extend_from_slice(bytes);
+                out
+            }
+            Value::Json(s) => {
+                let bytes = s.as_bytes();
+                let len = bytes.len() as u32;
+                let mut out = len.to_le_bytes().to_vec();
+                out.extend_from_slice(bytes);
+                out
+            }
         }
     }
 
@@ -154,6 +184,40 @@ impl Value {
                 let s = std::str::from_utf8(&bytes[4..4 + len])
                     .map_err(|e| SqlError::TypeError(format!("invalid UTF-8 in uuid: {e}")))?;
                 Ok(Value::Uuid(s.to_string()))
+            }
+            catalog::DataType::Array(inner) => {
+                if bytes.len() < 4 {
+                    return Err(SqlError::TypeError("not enough bytes for array".to_string()));
+                }
+                let len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+                if bytes.len() < 4 + len {
+                    return Err(SqlError::TypeError("array data truncated".to_string()));
+                }
+                let s = std::str::from_utf8(&bytes[4..4 + len])
+                    .map_err(|e| SqlError::TypeError(format!("invalid UTF-8 in array: {e}")))?;
+                let jv: serde_json::Value = serde_json::from_str(s)
+                    .map_err(|e| SqlError::TypeError(format!("invalid JSON array: {e}")))?;
+                match jv {
+                    serde_json::Value::Array(arr) => {
+                        let vals: Vec<Value> = arr.iter()
+                            .map(|item| json_value_to_value(item, inner))
+                            .collect::<Result<_, _>>()?;
+                        Ok(Value::Array(vals))
+                    }
+                    _ => Err(SqlError::TypeError("expected JSON array".to_string())),
+                }
+            }
+            catalog::DataType::Json | catalog::DataType::Jsonb => {
+                if bytes.len() < 4 {
+                    return Err(SqlError::TypeError("not enough bytes for json".to_string()));
+                }
+                let len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+                if bytes.len() < 4 + len {
+                    return Err(SqlError::TypeError("json data truncated".to_string()));
+                }
+                let s = std::str::from_utf8(&bytes[4..4 + len])
+                    .map_err(|e| SqlError::TypeError(format!("invalid UTF-8 in json: {e}")))?;
+                Ok(Value::Json(s.to_string()))
             }
         }
     }
@@ -277,6 +341,35 @@ impl Value {
                 }
             }
 
+            // Array → Text
+            (Value::Array(_), catalog::DataType::Text) => {
+                Ok(Value::Text(self.to_string()))
+            }
+            (Value::Array(_), catalog::DataType::VarChar(_)) => {
+                Ok(Value::Text(self.to_string()))
+            }
+            // Array → same Array
+            (Value::Array(_), catalog::DataType::Array(_)) => Ok(self.clone()),
+            // Json → same Json/Jsonb
+            (Value::Json(_), catalog::DataType::Json) => Ok(self.clone()),
+            (Value::Json(_), catalog::DataType::Jsonb) => Ok(self.clone()),
+            // Json → Text
+            (Value::Json(s), catalog::DataType::Text) => Ok(Value::Text(s.clone())),
+            (Value::Json(s), catalog::DataType::VarChar(_)) => Ok(Value::Text(s.clone())),
+            // Text → Json
+            (Value::Text(s), catalog::DataType::Json) => {
+                // Validate JSON
+                serde_json::from_str::<serde_json::Value>(s)
+                    .map(|_| Value::Json(s.clone()))
+                    .map_err(|e| SqlError::TypeError(format!("invalid JSON: {e}")))
+            }
+            // Text → Jsonb (stored as Json internally)
+            (Value::Text(s), catalog::DataType::Jsonb) => {
+                serde_json::from_str::<serde_json::Value>(s)
+                    .map(|_| Value::Json(s.clone()))
+                    .map_err(|e| SqlError::TypeError(format!("invalid JSON: {e}")))
+            }
+
             _ => Err(SqlError::TypeError(format!(
                 "cannot cast {:?} to {:?}",
                 self.data_type(),
@@ -300,12 +393,68 @@ impl std::fmt::Display for Value {
             Value::Timestamp(ts) => write!(f, "{}", format_timestamp(*ts)),
             Value::Numeric(s) => write!(f, "{s}"),
             Value::Uuid(s) => write!(f, "{s}"),
+            Value::Array(v) => {
+                // PostgreSQL array format: {elem1,elem2,...}
+                let parts: Vec<String> = v.iter().map(|x| match x {
+                    Value::Null => "NULL".to_string(),
+                    Value::Text(s) => format!("\"{}\"", s.replace('"', "\\\"")),
+                    other => other.to_string(),
+                }).collect();
+                write!(f, "{{{}}}", parts.join(","))
+            }
+            Value::Json(s) => write!(f, "{s}"),
         }
     }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Convert a Value to a serde_json::Value for serialization.
+pub fn value_to_json_value(v: &Value) -> serde_json::Value {
+    match v {
+        Value::Null => serde_json::Value::Null,
+        Value::Bool(b) => serde_json::Value::Bool(*b),
+        Value::Int4(i) => serde_json::Value::Number((*i).into()),
+        Value::Int8(i) => serde_json::Value::Number((*i).into()),
+        Value::Float8(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::Text(s) | Value::Numeric(s) | Value::Uuid(s) => serde_json::Value::String(s.clone()),
+        Value::Json(s) => serde_json::from_str(s).unwrap_or(serde_json::Value::String(s.clone())),
+        Value::Array(arr) => serde_json::Value::Array(arr.iter().map(value_to_json_value).collect()),
+        Value::Bytes(b) => serde_json::Value::String(hex_encode(b)),
+        Value::Date(d) => serde_json::Value::String(format_date(*d)),
+        Value::Timestamp(t) => serde_json::Value::String(format_timestamp(*t)),
+    }
+}
+
+/// Convert a serde_json::Value back to a Value given the expected element DataType.
+fn json_value_to_value(jv: &serde_json::Value, dtype: &catalog::DataType) -> Result<Value, SqlError> {
+    match (jv, dtype) {
+        (serde_json::Value::Null, _) => Ok(Value::Null),
+        (serde_json::Value::Bool(b), _) => Ok(Value::Bool(*b)),
+        (serde_json::Value::Number(n), catalog::DataType::Int4) => {
+            Ok(Value::Int4(n.as_i64().unwrap_or(0) as i32))
+        }
+        (serde_json::Value::Number(n), catalog::DataType::Int8) => {
+            Ok(Value::Int8(n.as_i64().unwrap_or(0)))
+        }
+        (serde_json::Value::Number(n), catalog::DataType::Float8) => {
+            Ok(Value::Float8(n.as_f64().unwrap_or(0.0)))
+        }
+        (serde_json::Value::Number(n), _) => Ok(Value::Text(n.to_string())),
+        (serde_json::Value::String(s), catalog::DataType::Text) | (serde_json::Value::String(s), catalog::DataType::VarChar(_)) => {
+            Ok(Value::Text(s.clone()))
+        }
+        (serde_json::Value::String(s), _) => Ok(Value::Text(s.clone())),
+        (serde_json::Value::Array(arr), catalog::DataType::Array(inner)) => {
+            let vals = arr.iter().map(|item| json_value_to_value(item, inner)).collect::<Result<_, _>>()?;
+            Ok(Value::Array(vals))
+        }
+        (other, _) => Ok(Value::Json(other.to_string())),
+    }
 }
 
 impl PartialOrd for Value {
@@ -361,6 +510,9 @@ impl PartialOrd for Value {
                 _ => None,
             },
             (Value::Uuid(a), Value::Uuid(b)) => a.partial_cmp(b),
+            (Value::Array(a), Value::Array(b)) => a.partial_cmp(b),
+            // Json is not orderable
+            (Value::Json(_), Value::Json(_)) => None,
             _ => None,
         }
     }

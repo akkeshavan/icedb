@@ -159,6 +159,8 @@ fn value_to_pg_type(value: &Value) -> Type {
         Value::Numeric(_) => Type::NUMERIC,
         Value::Uuid(_) => Type::UUID,
         Value::Null => Type::TEXT,
+        Value::Array(_) => Type::TEXT, // Send arrays as text representation
+        Value::Json(_) => Type::TEXT,  // Send JSON as text
     }
 }
 
@@ -174,6 +176,8 @@ fn datatype_to_pg_type(dt: &DataType) -> Type {
         DataType::Timestamp | DataType::TimestampTz => Type::TIMESTAMP,
         DataType::Numeric => Type::NUMERIC,
         DataType::Uuid => Type::UUID,
+        DataType::Array(_) => Type::TEXT,
+        DataType::Json | DataType::Jsonb => Type::TEXT,
     }
 }
 
@@ -212,7 +216,9 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()>
         | Value::Date(_)
         | Value::Timestamp(_)
         | Value::Numeric(_)
-        | Value::Uuid(_) => {
+        | Value::Uuid(_)
+        | Value::Array(_)
+        | Value::Json(_) => {
             let s = value.to_string();
             encoder.encode_field(&s)
         }
