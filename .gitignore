@@ -76,3 +76,4 @@ Thumbs.db
 *.bak
 /tmp/
 known_issues.md
+.claude/worktrees/    
