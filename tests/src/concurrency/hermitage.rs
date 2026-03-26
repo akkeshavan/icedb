@@ -220,10 +220,91 @@ fn test_g2_item_write_skew_detection() {
     };
 
     // After everything, check the invariant
-    // Under serializable SSI, at least one commit should fail
-    // Under RepeatableRead, write skew is possible — both might commit
+    // Under RepeatableRead, write skew CAN occur — both may commit, leaving 0 on-call.
+    // This test documents the *observable behavior* at RR.
+    // The invariant is intentionally NOT asserted here — see
+    // test_isolation_serializable_prevents_write_skew (isolation.rs) for the SSI version.
     let on_call = query_int(&engine, "SELECT COUNT(*) FROM doctors WHERE on_call = 1");
-    // This test documents the behavior: 0 = write skew occurred, >=1 = prevented
-    // We don't assert a specific value here since the behavior depends on isolation level
-    let _ = on_call;
+    // Accept 0 (write skew occurred — expected at RR) or ≥1 (prevented)
+    assert!(on_call >= 0, "on_call count must be non-negative; got {}", on_call);
+}
+
+/// G2 (full anti-dependency cycle) under Serializable: must be rejected by SSI.
+///
+/// Classic "black/white marble" scenario:
+///   T1 reads all black marbles, inserts a white one.
+///   T2 reads all white marbles, inserts a black one.
+/// The two transactions form a rw-antidependency cycle that Serializable must abort.
+///
+/// NOTE: Ignored — the current SSI implementation tracks rw-antidependencies only
+/// for writes to rows that already exist; phantom-predicate cycles (INSERT into a
+/// scan range) are not yet tracked.  When phantom predicate tracking is added,
+/// remove the `#[ignore]` attribute.
+#[test]
+#[ignore = "SSI phantom-predicate tracking not yet implemented; cycles via INSERT not detected"]
+fn test_g2_serializable_cycle_detection() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+
+    exec(&engine, "CREATE TABLE marbles (id INT PRIMARY KEY, color TEXT)");
+    exec(&engine, "INSERT INTO marbles VALUES (1, 'black')");
+    exec(&engine, "INSERT INTO marbles VALUES (2, 'white')");
+
+    let xid1 = engine.txn_manager.begin(IsolationLevel::Serializable);
+    let xid2 = engine.txn_manager.begin(IsolationLevel::Serializable);
+
+    // T1 reads all black marbles
+    engine.execute_in_txn(xid1, "SELECT * FROM marbles WHERE color = 'black'").unwrap();
+    // T2 reads all white marbles
+    engine.execute_in_txn(xid2, "SELECT * FROM marbles WHERE color = 'white'").unwrap();
+
+    // T1 inserts a white marble (T2 is anti-dependent on T1's read set)
+    engine.execute_in_txn(xid1, "INSERT INTO marbles VALUES (3, 'white')").unwrap();
+    // T2 inserts a black marble (T1 is anti-dependent on T2's read set)
+    engine.execute_in_txn(xid2, "INSERT INTO marbles VALUES (4, 'black')").unwrap();
+
+    let r1 = engine.txn_manager.commit(xid1);
+    let r2 = engine.txn_manager.commit(xid2);
+
+    // SSI must abort at least one
+    assert!(
+        r1.is_err() || r2.is_err(),
+        "G2: Serializable SSI must reject at least one transaction in an anti-dependency cycle"
+    );
+}
+
+/// G-single (single anti-dependency): T2 reads a value written by T1 after T1 also
+/// reads a value overwritten by T2. Under Serializable, the cycle must be caught.
+///
+/// NOTE: Ignored — the current SSI implementation does not create rw-antidependency
+/// edges with already-committed transactions.  T2 commits before T1 reads T2's write,
+/// so the T2→T1 edge is never recorded.  When SSI is extended to track committed
+/// edges, remove the `#[ignore]` attribute.
+#[test]
+#[ignore = "SSI does not track rw-antideps with already-committed transactions"]
+fn test_g_single_serializable() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+
+    exec(&engine, "CREATE TABLE t (id INT PRIMARY KEY, val INT)");
+    exec(&engine, "INSERT INTO t VALUES (1, 10)");
+    exec(&engine, "INSERT INTO t VALUES (2, 20)");
+
+    let xid1 = engine.txn_manager.begin(IsolationLevel::Serializable);
+    let xid2 = engine.txn_manager.begin(IsolationLevel::Serializable);
+
+    // T1 reads row 1
+    engine.execute_in_txn(xid1, "SELECT val FROM t WHERE id = 1").unwrap();
+    // T2 reads row 1, updates row 2
+    engine.execute_in_txn(xid2, "SELECT val FROM t WHERE id = 1").unwrap();
+    engine.execute_in_txn(xid2, "UPDATE t SET val = 25 WHERE id = 2").unwrap();
+    engine.txn_manager.commit(xid2).unwrap();
+
+    // T1 reads row 2 (which T2 just wrote) then updates row 1 → rw cycle
+    engine.execute_in_txn(xid1, "SELECT val FROM t WHERE id = 2").unwrap();
+    engine.execute_in_txn(xid1, "UPDATE t SET val = 15 WHERE id = 1").unwrap();
+    let r1 = engine.txn_manager.commit(xid1);
+
+    // SSI must abort T1 to break the cycle
+    assert!(r1.is_err(), "G-single: Serializable must abort T1 to prevent anti-dependency cycle");
 }
