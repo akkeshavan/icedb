@@ -8,3 +8,5 @@ pub mod concurrency;
 pub mod sql_conformance;
 #[cfg(test)]
 pub mod tutorial_validation;
+#[cfg(test)]
+pub mod integration;
