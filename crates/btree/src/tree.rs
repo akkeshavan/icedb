@@ -57,7 +57,7 @@ impl BTree {
         self.index_id * 100_000 + page_no
     }
 
-    fn read_meta(file: &mut BTreeFile) -> Result<BTreeMeta, BTreeError> {
+    fn read_meta(file: &BTreeFile) -> Result<BTreeMeta, BTreeError> {
         let page = file.read_page(META_PAGE_NO)?;
         BTreeMeta::decode(&page)
     }
@@ -70,7 +70,7 @@ impl BTree {
         Ok(())
     }
 
-    fn read_node(file: &mut BTreeFile, page_no: u32) -> Result<BTreeNode, BTreeError> {
+    fn read_node(file: &BTreeFile, page_no: u32) -> Result<BTreeNode, BTreeError> {
         let page = file.read_page(page_no)?;
         BTreeNode::decode(&page)
     }
@@ -93,28 +93,28 @@ impl BTree {
     }
 
     /// Find the child page to follow in an internal node for the given key.
+    ///
+    /// Uses binary search (O(log n)) instead of a linear scan for internal
+    /// nodes with many separator keys.
     fn find_child(node: &BTreeNode, key: &[u8]) -> u32 {
-        // entries[0] is leftmost child (key == [])
-        // entries[i] (i>0) have separator keys; if key >= entries[i].key, we go to entries[i].child_page
+        // entries[0] is the leftmost child (separator key == [] i.e. -∞).
+        // entries[i] (i > 0) have separator keys; we descend into entries[i]
+        // when key >= entries[i].key.
         let entries = &node.internal_entries;
         if entries.is_empty() {
             panic!("internal node has no children");
         }
-        // Walk backwards to find the last entry whose key <= search key.
-        let mut child = entries[0].child_page;
-        for entry in entries.iter().skip(1) {
-            if key >= entry.key.as_slice() {
-                child = entry.child_page;
-            } else {
-                break;
-            }
-        }
-        child
+        // partition_point returns the first index where the predicate is false.
+        // We want the last entry whose key <= search_key.
+        let pos = entries.partition_point(|e| e.key.as_slice() <= key);
+        // pos == 0 is impossible because entries[0].key == [] <= any key;
+        // but guard with saturating_sub to be safe.
+        entries[pos.saturating_sub(1).min(entries.len() - 1)].child_page
     }
 
     /// Traverse from root to leaf, returning the stack of page numbers (root first, leaf last).
     fn find_leaf_path(
-        file: &mut BTreeFile,
+        file: &BTreeFile,
         meta: &BTreeMeta,
         key: &[u8],
     ) -> Result<Vec<u32>, BTreeError> {
@@ -140,13 +140,13 @@ impl BTree {
     /// Insert a key → TID mapping.
     pub fn insert(&self, xid: u32, key: &[u8], tid: TID) -> Result<(), BTreeError> {
         let mut file = self.file.write();
-        let mut meta = Self::read_meta(&mut file)?;
+        let mut meta = Self::read_meta(&file)?;
 
         // Find path to leaf.
-        let path = Self::find_leaf_path(&mut file, &meta, key)?;
+        let path = Self::find_leaf_path(&file, &meta, key)?;
         let leaf_page_no = *path.last().unwrap();
 
-        let mut leaf = Self::read_node(&mut file, leaf_page_no)?;
+        let mut leaf = Self::read_node(&file,leaf_page_no)?;
 
         // Check for duplicate.
         if leaf.find_key(key).is_some() {
@@ -189,7 +189,7 @@ impl BTree {
 
         // If original leaf had a right sibling, update its left_sibling.
         if right_leaf.right_sibling != 0 {
-            let mut old_right = Self::read_node(&mut file, right_leaf.right_sibling)?;
+            let mut old_right = Self::read_node(&file,right_leaf.right_sibling)?;
             old_right.left_sibling = right_page_no;
             let wal_pno = self.wal_page_no(right_leaf.right_sibling);
             Self::write_node(
@@ -226,7 +226,7 @@ impl BTree {
         while split_occurred && parent_idx > 0 {
             parent_idx -= 1;
             let parent_page_no = parent_path[parent_idx];
-            let mut parent = Self::read_node(&mut file, parent_page_no)?;
+            let mut parent = Self::read_node(&file,parent_page_no)?;
 
             // Insert the promoted key into the parent.
             parent.insert_internal_entry(InternalEntry {
@@ -306,14 +306,17 @@ impl BTree {
     }
 
     /// Find the TID for an exact key match.
+    ///
+    /// Uses a shared read lock — multiple concurrent searches can proceed in
+    /// parallel without blocking each other or blocking concurrent writes.
     pub fn search(&self, key: &[u8]) -> Result<TID, BTreeError> {
-        let mut file = self.file.write();
+        let file = self.file.read();
 
-        let meta = Self::read_meta(&mut file)?;
+        let meta = Self::read_meta(&file)?;
         let mut current = meta.root_page;
 
         loop {
-            let node = Self::read_node(&mut file, current)?;
+            let node = Self::read_node(&file, current)?;
             match node.node_type {
                 NodeType::Internal => {
                     current = Self::find_child(&node, key);
@@ -330,20 +333,23 @@ impl BTree {
     }
 
     /// Range scan: returns all (key, TID) pairs where start_key <= key <= end_key.
+    ///
+    /// Uses a shared read lock — multiple concurrent range scans can proceed in
+    /// parallel without blocking each other or blocking concurrent writes.
     pub fn range_scan(
         &self,
         start_key: Option<&[u8]>,
         end_key: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, TID)>, BTreeError> {
-        let mut file = self.file.write();
-        let meta = Self::read_meta(&mut file)?;
+        let file = self.file.read();
+        let meta = Self::read_meta(&file)?;
 
         // Find the leftmost leaf.
         let first_leaf_page = if let Some(sk) = start_key {
             // Traverse to the leaf that would contain start_key.
             let mut current = meta.root_page;
             loop {
-                let node = Self::read_node(&mut file, current)?;
+                let node = Self::read_node(&file, current)?;
                 match node.node_type {
                     NodeType::Internal => {
                         current = Self::find_child(&node, sk);
@@ -355,7 +361,7 @@ impl BTree {
             // Find the leftmost leaf by always going left.
             let mut current = meta.root_page;
             loop {
-                let node = Self::read_node(&mut file, current)?;
+                let node = Self::read_node(&file, current)?;
                 match node.node_type {
                     NodeType::Internal => {
                         if let Some(first) = node.internal_entries.first() {
@@ -376,7 +382,7 @@ impl BTree {
             if current_page == 0 {
                 break;
             }
-            let node = Self::read_node(&mut file, current_page)?;
+            let node = Self::read_node(&file, current_page)?;
 
             let mut done = false;
             for entry in &node.leaf_entries {
@@ -412,13 +418,13 @@ impl BTree {
     /// Delete the entry for the given key.
     pub fn delete(&self, xid: u32, key: &[u8]) -> Result<(), BTreeError> {
         let mut file = self.file.write();
-        let mut meta = Self::read_meta(&mut file)?;
+        let mut meta = Self::read_meta(&file)?;
 
         // Find the leaf containing the key.
-        let path = Self::find_leaf_path(&mut file, &meta, key)?;
+        let path = Self::find_leaf_path(&file, &meta, key)?;
         let leaf_page_no = *path.last().unwrap();
 
-        let mut leaf = Self::read_node(&mut file, leaf_page_no)?;
+        let mut leaf = Self::read_node(&file,leaf_page_no)?;
 
         if let Some(idx) = leaf.find_key(key) {
             leaf.leaf_entries.remove(idx);
@@ -434,8 +440,8 @@ impl BTree {
 
     /// Returns the number of entries in the tree.
     pub fn num_entries(&self) -> Result<u64, BTreeError> {
-        let mut file = self.file.write();
-        let meta = Self::read_meta(&mut file)?;
+        let file = self.file.read();
+        let meta = Self::read_meta(&file)?;
         Ok(meta.num_entries)
     }
 

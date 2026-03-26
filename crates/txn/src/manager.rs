@@ -1,4 +1,4 @@
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -19,6 +19,11 @@ use wal::writer::WalWriter;
 
 pub struct TransactionManager {
     inner: Mutex<TxnManagerInner>,
+    /// Committed XID set lives outside the inner Mutex so that concurrent
+    /// visibility checks (scan_visible_tuples) can hold a shared read lock
+    /// while multiple scans execute in parallel without blocking each other
+    /// or blocking the commit path beyond a brief write-lock insertion.
+    committed: Arc<RwLock<HashSet<Xid>>>,
     wal_writer: Arc<WalWriter>,
     lock_manager: LockManager,
 }
@@ -26,8 +31,6 @@ pub struct TransactionManager {
 struct TxnManagerInner {
     /// Currently active transactions
     active: HashMap<Xid, Transaction>,
-    /// Set of committed XIDs (for visibility checks)
-    committed: HashSet<Xid>,
     /// Set of aborted XIDs
     aborted: HashSet<Xid>,
     /// Next XID counter (tracks what the next allocation will be)
@@ -39,10 +42,10 @@ impl TransactionManager {
         TransactionManager {
             inner: Mutex::new(TxnManagerInner {
                 active: HashMap::new(),
-                committed: HashSet::new(),
                 aborted: HashSet::new(),
                 next_xid: 3, // matches NEXT_XID atomic start
             }),
+            committed: Arc::new(RwLock::new(HashSet::new())),
             wal_writer,
             lock_manager: LockManager::new(),
         }
@@ -72,13 +75,11 @@ impl TransactionManager {
                         }
                         match record.record_type {
                             WalRecordType::Commit => {
-                                let mut inner = mgr.inner.lock();
-                                inner.committed.insert(xid);
-                                inner.aborted.remove(&xid);
+                                mgr.committed.write().insert(xid);
+                                mgr.inner.lock().aborted.remove(&xid);
                             }
                             WalRecordType::Abort => {
-                                let mut inner = mgr.inner.lock();
-                                inner.aborted.insert(xid);
+                                mgr.inner.lock().aborted.insert(xid);
                             }
                             _ => {}
                         }
@@ -140,12 +141,15 @@ impl TransactionManager {
         self.wal_writer
             .append_and_flush(xid, WalRecordType::Commit, 0, vec![])?;
 
-        // Move from active to committed
+        // Remove from active set, then add to committed.
+        // committed lives in a separate RwLock so readers don't contend with
+        // the inner Mutex; the two locks are always acquired in this order
+        // (inner first, committed second) to avoid deadlocks.
         {
             let mut inner = self.inner.lock();
             inner.active.remove(&xid);
-            inner.committed.insert(xid);
         }
+        self.committed.write().insert(xid);
 
         // Release all locks
         self.lock_manager.release_all(xid);
@@ -225,9 +229,13 @@ impl TransactionManager {
             }
         }
 
-        // Write WAL ABORT record
+        // Write WAL ABORT record — no fsync required.
+        // Abort records do not need to be durable: if we crash before the abort
+        // record reaches disk, recovery will find the XID neither in committed
+        // nor in aborted and treat it as implicitly aborted (its tuples have an
+        // uncommitted t_xmin, so they are invisible to all snapshots).
         self.wal_writer
-            .append_and_flush(xid, WalRecordType::Abort, 0, vec![])?;
+            .append(xid, WalRecordType::Abort, 0, vec![])?;
 
         // Move from active to aborted
         {
@@ -447,17 +455,24 @@ impl TransactionManager {
         heap: &mut HeapFile,
     ) -> Result<Vec<(TID, Tuple)>, TxnError> {
         let snapshot = self.current_snapshot(xid);
-        let (committed, is_serializable) = {
+        let is_serializable = {
             let inner = self.inner.lock();
-            let is_ser = inner
+            inner
                 .active
                 .get(&xid)
                 .map(|t| t.isolation == IsolationLevel::Serializable)
-                .unwrap_or(false);
-            (inner.committed.clone(), is_ser)
+                .unwrap_or(false)
         };
 
+        // Acquire a shared read lock on the committed set for the duration of the
+        // scan.  Multiple concurrent scans hold this lock simultaneously (readers
+        // don't block each other); commits briefly take an exclusive write lock to
+        // insert one XID.  This eliminates the O(n) clone that the old code did.
+        let committed = self.committed.read();
+
         let mut results = Vec::new();
+        // Accumulate SSI TIDs; apply in a single lock acquisition after the scan.
+        let mut ssi_tids: Vec<(u32, u16)> = Vec::new();
         let num_pages = heap.num_pages();
 
         for page_no in 0..num_pages {
@@ -501,16 +516,24 @@ impl TransactionManager {
                     };
                     let tid = TID::new(page_no, slot);
 
-                    // SSI: track read TIDs for Serializable transactions.
+                    // Accumulate SSI read TIDs — do NOT acquire inner lock per tuple.
                     if is_serializable {
-                        let mut inner = self.inner.lock();
-                        if let Some(txn) = inner.active.get_mut(&xid) {
-                            txn.read_set.insert((tid.page_no, tid.slot));
-                        }
+                        ssi_tids.push((tid.page_no, tid.slot));
                     }
 
                     results.push((tid, tuple));
                 }
+            }
+        }
+
+        // Release the committed read lock before acquiring the inner write lock.
+        drop(committed);
+
+        // SSI: record all read TIDs in a single lock acquisition.
+        if is_serializable && !ssi_tids.is_empty() {
+            let mut inner = self.inner.lock();
+            if let Some(txn) = inner.active.get_mut(&xid) {
+                txn.read_set.extend(ssi_tids);
             }
         }
 
@@ -519,12 +542,12 @@ impl TransactionManager {
 
     /// Return a snapshot of the committed XID set (used by VACUUM for dead tuple detection).
     pub fn committed_set(&self) -> HashSet<Xid> {
-        self.inner.lock().committed.clone()
+        self.committed.read().clone()
     }
 
     /// Check if an XID is in the committed set (for testing/inspection).
     pub fn is_committed(&self, xid: Xid) -> bool {
-        self.inner.lock().committed.contains(&xid)
+        self.committed.read().contains(&xid)
     }
 
     /// Check if an XID is in the aborted set (for testing/inspection).

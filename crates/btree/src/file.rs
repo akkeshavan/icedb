@@ -1,6 +1,11 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 
 use crate::error::BTreeError;
 use crate::node::PAGE_SIZE;
@@ -26,12 +31,23 @@ impl BTreeFile {
         })
     }
 
-    /// Read a full page from the file.
-    pub fn read_page(&mut self, page_no: u32) -> Result<[u8; PAGE_SIZE], BTreeError> {
+    /// Read a full page from the file using positional I/O (no seek required).
+    ///
+    /// Takes `&self` (not `&mut self`) so concurrent reads can proceed under a
+    /// shared `RwLock` without serializing through a write lock.
+    pub fn read_page(&self, page_no: u32) -> Result<[u8; PAGE_SIZE], BTreeError> {
         let offset = page_no as u64 * PAGE_SIZE as u64;
-        self.file.seek(SeekFrom::Start(offset))?;
         let mut buf = [0u8; PAGE_SIZE];
-        self.file.read_exact(&mut buf)?;
+        #[cfg(unix)]
+        self.file.read_at(&mut buf, offset)?;
+        #[cfg(windows)]
+        self.file.seek_read(&mut buf, offset)?;
+        #[cfg(not(any(unix, windows)))]
+        {
+            // Fallback: this path requires &mut self; on unsupported platforms
+            // callers must obtain a write guard.
+            compile_error!("read_page requires unix or windows for positional I/O");
+        }
         Ok(buf)
     }
 
