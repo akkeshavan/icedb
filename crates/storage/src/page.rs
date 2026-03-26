@@ -106,6 +106,7 @@ impl ItemId {
 ///  …   …       free space
 ///  …   …       tuple data (grows upward toward pd_upper)
 /// ```
+#[derive(Clone)]
 pub struct Page {
     data: Box<[u8; PAGE_SIZE]>,
 }

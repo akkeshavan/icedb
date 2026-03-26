@@ -369,6 +369,58 @@ impl TransactionManager {
         Ok(())
     }
 
+    /// Undo a previous insert by marking the tuple deleted within the same transaction.
+    ///
+    /// Sets `t_xmax = xid` so the tuple is invisible to all future scans while
+    /// the transaction is open.  Used exclusively by `ROLLBACK TO SAVEPOINT`.
+    pub fn undo_insert(&self, xid: Xid, heap: &mut HeapFile, tid: TID) -> Result<(), TxnError> {
+        let mut tuple = heap
+            .get_tuple(tid)
+            .map_err(|e| TxnError::Storage(storage::error::StorageError::Heap(e)))?;
+        // Safety: only undo our own inserts.
+        if tuple.header.t_xmin != xid {
+            return Ok(());
+        }
+        tuple.header.t_xmax = xid;
+        let mut page = heap
+            .read_page(tid.page_no)
+            .map_err(|e| TxnError::Storage(storage::error::StorageError::Heap(e)))?;
+        write_tuple_to_page(&mut page, tid.slot, &tuple)
+            .map_err(|e| TxnError::Storage(storage::error::StorageError::Page(e)))?;
+        self.wal_writer
+            .append(xid, WalRecordType::PageImage, tid.page_no, page.as_bytes().to_vec())?;
+        heap.write_page(tid.page_no, &page)
+            .map_err(|e| TxnError::Storage(storage::error::StorageError::Heap(e)))?;
+        log::debug!("txn {xid}: undo-insert (mark deleted) at {tid}");
+        Ok(())
+    }
+
+    /// Undo a previous soft-delete by clearing `t_xmax`.
+    ///
+    /// Restores the tuple's visibility inside the current transaction.
+    /// Used exclusively by `ROLLBACK TO SAVEPOINT`.
+    pub fn undo_delete(&self, xid: Xid, heap: &mut HeapFile, tid: TID) -> Result<(), TxnError> {
+        let mut tuple = heap
+            .get_tuple(tid)
+            .map_err(|e| TxnError::Storage(storage::error::StorageError::Heap(e)))?;
+        // Safety: only undo our own deletes.
+        if tuple.header.t_xmax != xid {
+            return Ok(());
+        }
+        tuple.header.t_xmax = INVALID_XID;
+        let mut page = heap
+            .read_page(tid.page_no)
+            .map_err(|e| TxnError::Storage(storage::error::StorageError::Heap(e)))?;
+        write_tuple_to_page(&mut page, tid.slot, &tuple)
+            .map_err(|e| TxnError::Storage(storage::error::StorageError::Page(e)))?;
+        self.wal_writer
+            .append(xid, WalRecordType::PageImage, tid.page_no, page.as_bytes().to_vec())?;
+        heap.write_page(tid.page_no, &page)
+            .map_err(|e| TxnError::Storage(storage::error::StorageError::Heap(e)))?;
+        log::debug!("txn {xid}: undo-delete (restore) at {tid}");
+        Ok(())
+    }
+
     /// Update a tuple: soft-delete old, insert new. Returns new TID.
     ///
     /// WAL is handled by the individual delete_tuple and insert_tuple calls

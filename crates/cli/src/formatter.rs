@@ -32,7 +32,7 @@ pub fn format_table(rows: &[Row]) -> String {
 
 pub fn format_value(v: &Value) -> String {
     match v {
-        Value::Null => "".to_string(),
+        Value::Null => "NULL".to_string(),
         Value::Bool(b) => {
             if *b {
                 "t".to_string()

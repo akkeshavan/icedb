@@ -142,6 +142,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "catalog",
+ "getrandom 0.2.17",
  "hmac",
  "log",
  "parking_lot",

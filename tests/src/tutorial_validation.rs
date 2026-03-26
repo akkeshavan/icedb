@@ -86,8 +86,8 @@ fn setup_bookstore(engine: &Arc<sql::engine::QueryEngine>) {
 
     // --- ch03: Genre tables (needed for JOIN USING) ---
     ok(engine, "CREATE TABLE genres (
-        id   INT NOT NULL,
-        name TEXT NOT NULL
+        genre_id INT NOT NULL,
+        name     TEXT NOT NULL
     )");
     ok(engine, "CREATE TABLE book_genres (
         book_id  INT NOT NULL,
@@ -154,10 +154,10 @@ fn test_tutorial_all_sql_examples() {
     // -----------------------------------------------------------------------
     // ch03: JOIN USING
     // -----------------------------------------------------------------------
-    ok(&engine, "SELECT bg.book_id, g.name AS genre
+    rows_count(&engine, "SELECT bg.book_id, g.name AS genre
         FROM book_genres bg
         JOIN genres g USING (genre_id)
-        ORDER BY bg.book_id");
+        ORDER BY bg.book_id", 7);
 
     // -----------------------------------------------------------------------
     // ch03: IS NULL / IS NOT NULL
@@ -189,7 +189,7 @@ fn test_tutorial_all_sql_examples() {
     );
     rows_count(
         &engine,
-        "UPDATE books SET price = price * 0.90 WHERE author_id = 4 RETURNING title, price",
+        "UPDATE books SET price = ROUND(price * 0.90, 2) WHERE author_id = 4 RETURNING title, price",
         1,
     );
     rows_count(
@@ -201,15 +201,17 @@ fn test_tutorial_all_sql_examples() {
     // -----------------------------------------------------------------------
     // ch03: UNION
     // -----------------------------------------------------------------------
-    ok(&engine, "SELECT name AS label, 'author' AS kind FROM authors
+    // After DELETE FROM authors WHERE id=6 (Anonymous), 5 authors remain + 7 books = 12 rows
+    rows_count(&engine, "SELECT name AS label, 'author' AS kind FROM authors
         UNION
         SELECT title, 'book' FROM books
-        ORDER BY kind, label");
+        ORDER BY kind, label", 12);
 
     // -----------------------------------------------------------------------
     // ch03: CTE (chained WITH)
     // -----------------------------------------------------------------------
-    ok(&engine, "WITH book_revenue AS (
+    // At this point orders 1-6 are present; Tolkien=125.94, Herbert=95.94 both > 50.00
+    rows_count(&engine, "WITH book_revenue AS (
         SELECT b.author_id, b.title, SUM(o.total_price) AS revenue
         FROM books b
         JOIN orders o ON o.book_id = b.id
@@ -224,16 +226,16 @@ fn test_tutorial_all_sql_examples() {
     SELECT name, total_revenue
     FROM author_revenue
     WHERE total_revenue > 50.00
-    ORDER BY total_revenue DESC");
+    ORDER BY total_revenue DESC", 2);
 
     // -----------------------------------------------------------------------
     // ch03: Aggregates
     // -----------------------------------------------------------------------
-    ok(&engine, "SELECT a.name, COUNT(*) AS book_count
+    rows_count(&engine, "SELECT a.name, COUNT(*) AS book_count
         FROM books b
         JOIN authors a ON b.author_id = a.id
         GROUP BY a.name
-        ORDER BY book_count DESC");
+        ORDER BY book_count DESC, a.name", 4);
 
     ok(&engine, "SELECT
         AVG(price) AS avg_price,
@@ -251,7 +253,7 @@ fn test_tutorial_all_sql_examples() {
     // -----------------------------------------------------------------------
     // ch03: UPDATE
     // -----------------------------------------------------------------------
-    ok(&engine, "UPDATE books SET price = price * 1.10 WHERE author_id = 2");
+    ok(&engine, "UPDATE books SET price = ROUND(price * 1.10, 2) WHERE author_id = 2");
     ok(&engine, "SELECT title, price FROM books WHERE author_id = 2");
     ok(&engine, "UPDATE authors SET name = 'Ursula K. Le Guin' WHERE id = 3");
 
@@ -275,7 +277,9 @@ fn test_tutorial_all_sql_examples() {
     // -----------------------------------------------------------------------
     // ch03: Advanced — COALESCE
     // -----------------------------------------------------------------------
-    ok(&engine, "SELECT name, COALESCE(country, 'Unknown') AS country FROM authors ORDER BY name");
+    ok(&engine, "INSERT INTO authors VALUES (6, 'Anonymous', NULL)");
+    rows_count(&engine, "SELECT name, COALESCE(country, 'Unknown') AS country FROM authors ORDER BY name", 5);
+    ok(&engine, "DELETE FROM authors WHERE id = 6");
 
     // -----------------------------------------------------------------------
     // ch03: Advanced — ALTER TABLE ADD COLUMN, RENAME COLUMN, DROP COLUMN, RENAME TABLE
@@ -501,9 +505,9 @@ fn test_tutorial_all_sql_examples() {
     // -----------------------------------------------------------------------
     // ch04: JOIN USING
     // -----------------------------------------------------------------------
-    ok(&engine, "SELECT book_id, g.name AS genre
+    rows_count(&engine, "SELECT book_id, g.name AS genre
         FROM book_genres
-        JOIN genres g USING (genre_id)");
+        JOIN genres g USING (genre_id)", 7);
 
     // -----------------------------------------------------------------------
     // ch04: Qualified column references
@@ -932,4 +936,608 @@ fn test_tutorial_all_sql_examples() {
     ok(&engine, "DROP DATABASE IF EXISTS testdb_tut2");
     ok(&engine, "CREATE SCHEMA reporting");
     ok(&engine, "CREATE SCHEMA IF NOT EXISTS reporting");    // idempotent
+}
+
+// ---------------------------------------------------------------------------
+// Chapter 3 value-level validation
+// ---------------------------------------------------------------------------
+
+/// Format a Value for comparison against the chapter's expected text output.
+/// Matches the Display impl in sql::value::Value.
+fn fmt_val(v: &sql::Value) -> String {
+    format!("{v}")
+}
+
+/// Run `sql`, assert row count matches expected_rows.len(), and assert each
+/// column value (as a formatted string) matches the expected matrix.
+///
+/// expected_rows: slice of row slices; each inner slice holds one string per column.
+fn val(
+    engine: &Arc<sql::engine::QueryEngine>,
+    sql: &str,
+    expected_rows: &[&[&str]],
+) {
+    let result = engine
+        .execute(sql)
+        .unwrap_or_else(|e| panic!("Query failed:\n  SQL: {sql}\n  Err: {e}"));
+
+    assert_eq!(
+        result.rows.len(),
+        expected_rows.len(),
+        "Row count mismatch for:\n  SQL: {sql}\n  Got {} rows, expected {}",
+        result.rows.len(),
+        expected_rows.len(),
+    );
+
+    for (row_idx, (row, expected_cols)) in result.rows.iter().zip(expected_rows.iter()).enumerate() {
+        for (col_idx, expected) in expected_cols.iter().enumerate() {
+            let got = row
+                .get_by_idx(col_idx)
+                .unwrap_or_else(|| panic!(
+                    "Column {col_idx} missing at row {row_idx} for SQL: {sql}"
+                ));
+            let got_str = fmt_val(got);
+            assert_eq!(
+                got_str.as_str(),
+                *expected,
+                "Value mismatch at row {row_idx}, col {col_idx} for:\n  SQL: {sql}\n  Got: {got_str}\n  Expected: {expected}",
+            );
+        }
+    }
+}
+
+#[test]
+fn test_tutorial_chapter3_values() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(dir.path());
+
+    // -----------------------------------------------------------------------
+    // Step 1: DDL + initial data (mirrors setup_bookstore but inline so the
+    //         state progression is explicit and matches the chapter exactly)
+    // -----------------------------------------------------------------------
+    ok(&engine, "CREATE TABLE authors (id INT NOT NULL, name TEXT NOT NULL, country TEXT)");
+    ok(&engine, "CREATE TABLE books (id INT NOT NULL, title TEXT NOT NULL, author_id INT NOT NULL, price FLOAT, published INT)");
+    ok(&engine, "CREATE TABLE orders (id INT NOT NULL, book_id INT NOT NULL, quantity INT NOT NULL, total_price FLOAT)");
+
+    ok(&engine, "INSERT INTO authors VALUES (1, 'J.R.R. Tolkien', 'United Kingdom')");
+    ok(&engine, "INSERT INTO authors VALUES (2, 'Frank Herbert', 'United States')");
+    ok(&engine, "INSERT INTO authors VALUES (3, 'Ursula K. Le Guin', 'United States')");
+    ok(&engine, "INSERT INTO authors VALUES (4, 'Cormac McCarthy', 'United States')");
+
+    ok(&engine, "INSERT INTO books VALUES (1, 'The Hobbit', 1, 12.99, 1937)");
+    ok(&engine, "INSERT INTO books VALUES (2, 'The Lord of the Rings', 1, 24.99, 1954)");
+    ok(&engine, "INSERT INTO books VALUES (3, 'Dune', 2, 15.99, 1965)");
+    ok(&engine, "INSERT INTO books VALUES (4, 'The Left Hand of Darkness', 3, 13.99, 1969)");
+    ok(&engine, "INSERT INTO books VALUES (5, 'The Dispossessed', 3, 11.99, 1974)");
+    ok(&engine, "INSERT INTO books VALUES (6, 'Blood Meridian', 4, 14.99, 1985)");
+    ok(&engine, "INSERT INTO books VALUES (7, 'Children of Dune', 2, 13.99, 1976)");
+
+    ok(&engine, "INSERT INTO orders VALUES (1, 1, 2, 25.98)");
+    ok(&engine, "INSERT INTO orders VALUES (2, 3, 1, 15.99)");
+    ok(&engine, "INSERT INTO orders VALUES (3, 2, 1, 24.99)");
+    ok(&engine, "INSERT INTO orders VALUES (4, 4, 3, 41.97)");
+    ok(&engine, "INSERT INTO orders VALUES (5, 3, 5, 79.95)");
+
+    // -----------------------------------------------------------------------
+    // SELECT * FROM books  (chapter p. "Retrieve all books")
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "SELECT * FROM books",
+        &[
+            &["1", "The Hobbit",                 "1", "12.99", "1937"],
+            &["2", "The Lord of the Rings",       "1", "24.99", "1954"],
+            &["3", "Dune",                        "2", "15.99", "1965"],
+            &["4", "The Left Hand of Darkness",   "3", "13.99", "1969"],
+            &["5", "The Dispossessed",             "3", "11.99", "1974"],
+            &["6", "Blood Meridian",               "4", "14.99", "1985"],
+            &["7", "Children of Dune",             "2", "13.99", "1976"],
+        ],
+    );
+
+    // -----------------------------------------------------------------------
+    // SELECT title, price FROM books WHERE price < 14.00
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "SELECT title, price FROM books WHERE price < 14.00",
+        &[
+            &["The Hobbit",                 "12.99"],
+            &["The Left Hand of Darkness",  "13.99"],
+            &["The Dispossessed",           "11.99"],
+            &["Children of Dune",           "13.99"],
+        ],
+    );
+
+    // -----------------------------------------------------------------------
+    // WHERE published < 1970
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "SELECT title, published FROM books WHERE published < 1970",
+        &[
+            &["The Hobbit",                "1937"],
+            &["The Lord of the Rings",     "1954"],
+            &["Dune",                      "1965"],
+            &["The Left Hand of Darkness", "1969"],
+        ],
+    );
+
+    // -----------------------------------------------------------------------
+    // WHERE price > 13.00 AND published > 1960
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "SELECT title, price FROM books WHERE price > 13.00 AND published > 1960",
+        &[
+            &["Dune",                      "15.99"],
+            &["The Left Hand of Darkness", "13.99"],
+            &["Blood Meridian",            "14.99"],
+            &["Children of Dune",          "13.99"],
+        ],
+    );
+
+    // -----------------------------------------------------------------------
+    // ORDER BY price ASC
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "SELECT title, price FROM books ORDER BY price ASC",
+        &[
+            &["The Dispossessed",           "11.99"],
+            &["The Hobbit",                 "12.99"],
+            &["The Left Hand of Darkness",  "13.99"],
+            &["Children of Dune",           "13.99"],
+            &["Blood Meridian",             "14.99"],
+            &["Dune",                       "15.99"],
+            &["The Lord of the Rings",      "24.99"],
+        ],
+    );
+
+    // -----------------------------------------------------------------------
+    // LIMIT 3 most expensive
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "SELECT title, price FROM books ORDER BY price DESC LIMIT 3",
+        &[
+            &["The Lord of the Rings", "24.99"],
+            &["Dune",                  "15.99"],
+            &["Blood Meridian",        "14.99"],
+        ],
+    );
+
+    // -----------------------------------------------------------------------
+    // INNER JOIN books -> authors
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "SELECT b.title, a.name AS author, b.price
+         FROM books b
+         JOIN authors a ON b.author_id = a.id
+         ORDER BY a.name, b.title",
+        &[
+            &["Blood Meridian",              "Cormac McCarthy",   "14.99"],
+            &["Children of Dune",            "Frank Herbert",     "13.99"],
+            &["Dune",                        "Frank Herbert",     "15.99"],
+            &["The Hobbit",                  "J.R.R. Tolkien",    "12.99"],
+            &["The Lord of the Rings",       "J.R.R. Tolkien",    "24.99"],
+            &["The Dispossessed",            "Ursula K. Le Guin", "11.99"],
+            &["The Left Hand of Darkness",   "Ursula K. Le Guin", "13.99"],
+        ],
+    );
+
+    // -----------------------------------------------------------------------
+    // INNER JOIN orders -> books
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "SELECT o.id AS order_id, b.title, o.quantity, o.total_price
+         FROM orders o
+         JOIN books b ON o.book_id = b.id
+         ORDER BY o.id",
+        &[
+            &["1", "The Hobbit",                "2", "25.98"],
+            &["2", "Dune",                      "1", "15.99"],
+            &["3", "The Lord of the Rings",     "1", "24.99"],
+            &["4", "The Left Hand of Darkness", "3", "41.97"],
+            &["5", "Dune",                      "5", "79.95"],
+        ],
+    );
+
+    // -----------------------------------------------------------------------
+    // LEFT JOIN — after inserting Gene Wolfe (id=5)
+    // -----------------------------------------------------------------------
+    ok(&engine, "INSERT INTO authors VALUES (5, 'Gene Wolfe', 'United States')");
+
+    val(
+        &engine,
+        "SELECT a.name, b.title
+         FROM authors a
+         LEFT JOIN books b ON b.author_id = a.id
+         ORDER BY a.name, b.title",
+        &[
+            &["Cormac McCarthy",   "Blood Meridian"],
+            &["Frank Herbert",     "Children of Dune"],
+            &["Frank Herbert",     "Dune"],
+            &["Gene Wolfe",        "NULL"],
+            &["J.R.R. Tolkien",    "The Hobbit"],
+            &["J.R.R. Tolkien",    "The Lord of the Rings"],
+            &["Ursula K. Le Guin", "The Dispossessed"],
+            &["Ursula K. Le Guin", "The Left Hand of Darkness"],
+        ],
+    );
+
+    // -----------------------------------------------------------------------
+    // JOIN USING — genre tables
+    // -----------------------------------------------------------------------
+    ok(&engine, "CREATE TABLE genres (genre_id INT NOT NULL, name TEXT NOT NULL)");
+    ok(&engine, "CREATE TABLE book_genres (book_id INT NOT NULL, genre_id INT NOT NULL)");
+    ok(&engine, "INSERT INTO genres VALUES (1, 'Fantasy'), (2, 'Science Fiction'), (3, 'Western')");
+    ok(&engine, "INSERT INTO book_genres VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 2), (6, 3), (7, 2)");
+
+    val(
+        &engine,
+        "SELECT bg.book_id, g.name AS genre
+         FROM book_genres bg
+         JOIN genres g USING (genre_id)
+         ORDER BY bg.book_id",
+        &[
+            &["1", "Fantasy"],
+            &["2", "Fantasy"],
+            &["3", "Science Fiction"],
+            &["4", "Science Fiction"],
+            &["5", "Science Fiction"],
+            &["6", "Western"],
+            &["7", "Science Fiction"],
+        ],
+    );
+
+    // -----------------------------------------------------------------------
+    // IS NULL — 0 rows before, then 1 row after inserting Anonymous
+    // -----------------------------------------------------------------------
+    val(&engine, "SELECT name FROM authors WHERE country IS NULL", &[]);
+
+    ok(&engine, "INSERT INTO authors VALUES (6, 'Anonymous', NULL)");
+
+    val(
+        &engine,
+        "SELECT name FROM authors WHERE country IS NULL",
+        &[&["Anonymous"]],
+    );
+
+    // -----------------------------------------------------------------------
+    // ILIKE
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "SELECT name FROM authors WHERE name ILIKE '%ursula%'",
+        &[&["Ursula K. Le Guin"]],
+    );
+
+    // -----------------------------------------------------------------------
+    // DISTINCT country
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "SELECT DISTINCT country FROM authors WHERE country IS NOT NULL ORDER BY country",
+        &[
+            &["United Kingdom"],
+            &["United States"],
+        ],
+    );
+
+    // -----------------------------------------------------------------------
+    // RETURNING — INSERT order 6
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "INSERT INTO orders VALUES (6, 2, 3, 74.97) RETURNING id, total_price",
+        &[&["6", "74.97"]],
+    );
+
+    // -----------------------------------------------------------------------
+    // RETURNING — UPDATE Blood Meridian price (10% discount)
+    //   ROUND(14.99 * 0.90, 2) = ROUND(13.491, 2) = 13.49
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "UPDATE books SET price = ROUND(price * 0.90, 2) WHERE author_id = 4 RETURNING title, price",
+        &[&["Blood Meridian", "13.49"]],
+    );
+
+    // -----------------------------------------------------------------------
+    // RETURNING — DELETE Anonymous (id=6)
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "DELETE FROM authors WHERE id = 6 RETURNING name",
+        &[&["Anonymous"]],
+    );
+
+    // -----------------------------------------------------------------------
+    // UNION — 5 authors (Gene Wolfe still present) + 7 books = 12 rows
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "SELECT name AS label, 'author' AS kind FROM authors
+         UNION
+         SELECT title, 'book' FROM books
+         ORDER BY kind, label",
+        &[
+            &["Cormac McCarthy",            "author"],
+            &["Frank Herbert",              "author"],
+            &["Gene Wolfe",                 "author"],
+            &["J.R.R. Tolkien",             "author"],
+            &["Ursula K. Le Guin",          "author"],
+            &["Blood Meridian",             "book"],
+            &["Children of Dune",           "book"],
+            &["Dune",                       "book"],
+            &["The Dispossessed",           "book"],
+            &["The Hobbit",                 "book"],
+            &["The Left Hand of Darkness",  "book"],
+            &["The Lord of the Rings",      "book"],
+        ],
+    );
+
+    // -----------------------------------------------------------------------
+    // CTE — author revenue > $50
+    //   Tolkien:  orders 1 (25.98) + 3 (24.99) + 6 (74.97) = 125.94
+    //   Herbert:  orders 2 (15.99) + 5 (79.95) = 95.94
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "WITH book_revenue AS (
+            SELECT b.author_id, b.title, SUM(o.total_price) AS revenue
+            FROM books b
+            JOIN orders o ON o.book_id = b.id
+            GROUP BY b.author_id, b.title
+        ),
+        author_revenue AS (
+            SELECT a.name, SUM(br.revenue) AS total_revenue
+            FROM book_revenue br
+            JOIN authors a ON a.id = br.author_id
+            GROUP BY a.name
+        )
+        SELECT name, total_revenue
+        FROM author_revenue
+        WHERE total_revenue > 50.00
+        ORDER BY total_revenue DESC",
+        &[
+            &["J.R.R. Tolkien", "125.94"],
+            &["Frank Herbert",  "95.94"],
+        ],
+    );
+
+    // -----------------------------------------------------------------------
+    // Aggregates — book count per author
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "SELECT a.name, COUNT(*) AS book_count
+         FROM books b
+         JOIN authors a ON b.author_id = a.id
+         GROUP BY a.name
+         ORDER BY book_count DESC, a.name",
+        &[
+            &["Frank Herbert",      "2"],
+            &["J.R.R. Tolkien",     "2"],
+            &["Ursula K. Le Guin",  "2"],
+            &["Cormac McCarthy",    "1"],
+        ],
+    );
+
+    // -----------------------------------------------------------------------
+    // Aggregates — AVG/MIN/MAX/SUM of prices
+    //   At this point Blood Meridian = 13.49 (discounted in RETURNING section).
+    //   Prices: 12.99, 24.99, 15.99, 13.99, 11.99, 13.49, 13.99
+    //   Sum  = 107.43
+    //   Min  = 11.99
+    //   Max  = 24.99
+    //   Avg  = 107.43 / 7 = 15.347142857142857...
+    // -----------------------------------------------------------------------
+    {
+        let r = engine.execute(
+            "SELECT AVG(price) AS avg_price, MIN(price) AS min_price,
+                    MAX(price) AS max_price, SUM(price) AS total_catalog_value
+             FROM books"
+        ).expect("AVG query should succeed");
+        assert_eq!(r.rows.len(), 1, "AVG query should return 1 row");
+        let avg_val = r.rows[0].get_by_idx(0).map(|v| format!("{v}")).unwrap_or_default();
+        let min_val = r.rows[0].get_by_idx(1).map(|v| format!("{v}")).unwrap_or_default();
+        let max_val = r.rows[0].get_by_idx(2).map(|v| format!("{v}")).unwrap_or_default();
+        let sum_val = r.rows[0].get_by_idx(3).map(|v| format!("{v}")).unwrap_or_default();
+        assert_eq!(min_val, "11.99", "MIN(price) should be 11.99");
+        assert_eq!(max_val, "24.99", "MAX(price) should be 24.99");
+        // Float arithmetic: 107.43 stored as 107.42999999999998 due to f64 precision
+        assert_eq!(sum_val, "107.42999999999998", "SUM(price) float repr");
+        // Avg: 107.42999999999998 / 7 = 15.347142857142854
+        assert_eq!(avg_val, "15.347142857142854", "AVG(price) float repr");
+    }
+
+    // -----------------------------------------------------------------------
+    // Aggregates — revenue per book (ORDER BY revenue DESC)
+    //   At this point order 6 (book_id=2, qty=3, 74.97) has been inserted.
+    //   The Lord of the Rings (book_id=2): orders 3+6 qty=1+3=4  rev=24.99+74.97=99.96
+    //   Dune (book_id=3):                  orders 2+5 qty=1+5=6  rev=15.99+79.95=95.94
+    //   The Left Hand... (book_id=4):      order  4   qty=3       rev=41.97
+    //   The Hobbit (book_id=1):            order  1   qty=2       rev=25.98
+    //
+    // ORDER BY revenue DESC: 99.96 > 95.94 > 41.97 > 25.98
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "SELECT b.title, SUM(o.quantity) AS units_sold, SUM(o.total_price) AS revenue
+         FROM orders o
+         JOIN books b ON o.book_id = b.id
+         GROUP BY b.title
+         ORDER BY revenue DESC",
+        &[
+            &["The Lord of the Rings",     "4", "99.96"],
+            &["Dune",                      "6", "95.94"],
+            &["The Left Hand of Darkness", "3", "41.97"],
+            &["The Hobbit",                "2", "25.98"],
+        ],
+    );
+
+    // -----------------------------------------------------------------------
+    // UPDATE Herbert books +10%
+    //   Dune:             ROUND(15.99 * 1.10, 2) = ROUND(17.589, 2) = 17.59
+    //   Children of Dune: ROUND(13.99 * 1.10, 2) = ROUND(15.389, 2) = 15.39
+    // -----------------------------------------------------------------------
+    ok(&engine, "UPDATE books SET price = ROUND(price * 1.10, 2) WHERE author_id = 2");
+
+    val(
+        &engine,
+        "SELECT title, price FROM books WHERE author_id = 2",
+        &[
+            &["Dune",             "17.59"],
+            &["Children of Dune", "15.39"],
+        ],
+    );
+
+    // -----------------------------------------------------------------------
+    // DELETE Gene Wolfe (id=5) and orders for book_id=1
+    // -----------------------------------------------------------------------
+    ok(&engine, "DELETE FROM authors WHERE id = 5");
+    ok(&engine, "DELETE FROM orders WHERE book_id = 1");
+
+    // -----------------------------------------------------------------------
+    // CASE WHEN — all 7 books with updated prices
+    //   After updates: Blood Meridian=13.49, Dune=17.59, Children=15.39;
+    //   others unchanged.
+    //   ORDER BY price:
+    //     The Dispossessed   11.99  budget
+    //     The Hobbit         12.99  budget
+    //     Blood Meridian     13.49  mid-range
+    //     The Left Hand...   13.99  mid-range
+    //     Children of Dune   15.39  mid-range
+    //     Dune               17.59  mid-range
+    //     The Lord...        24.99  premium
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "SELECT title, price,
+               CASE WHEN price < 13.00 THEN 'budget'
+                    WHEN price < 20.00 THEN 'mid-range'
+                    ELSE 'premium'
+               END AS tier
+         FROM books
+         ORDER BY price",
+        &[
+            &["The Dispossessed",           "11.99", "budget"],
+            &["The Hobbit",                 "12.99", "budget"],
+            &["Blood Meridian",             "13.49", "mid-range"],
+            &["The Left Hand of Darkness",  "13.99", "mid-range"],
+            &["Children of Dune",           "15.39", "mid-range"],
+            &["Dune",                       "17.59", "mid-range"],
+            &["The Lord of the Rings",      "24.99", "premium"],
+        ],
+    );
+
+    // -----------------------------------------------------------------------
+    // COALESCE — insert Anonymous (id=6), query 5 rows, delete
+    //   (4 remaining authors after Gene Wolfe deleted + Anonymous = 5)
+    // -----------------------------------------------------------------------
+    ok(&engine, "INSERT INTO authors VALUES (6, 'Anonymous', NULL)");
+
+    val(
+        &engine,
+        "SELECT name, COALESCE(country, 'Unknown') AS country FROM authors ORDER BY name",
+        &[
+            &["Anonymous",          "Unknown"],
+            &["Cormac McCarthy",    "United States"],
+            &["Frank Herbert",      "United States"],
+            &["J.R.R. Tolkien",     "United Kingdom"],
+            &["Ursula K. Le Guin",  "United States"],
+        ],
+    );
+
+    ok(&engine, "DELETE FROM authors WHERE id = 6");
+
+    // -----------------------------------------------------------------------
+    // ALTER TABLE ADD COLUMN + UPDATE bio
+    // -----------------------------------------------------------------------
+    ok(&engine, "ALTER TABLE authors ADD COLUMN bio TEXT");
+    ok(&engine, "UPDATE authors SET bio = 'Author of Middle-earth.' WHERE id = 1");
+
+    val(
+        &engine,
+        "SELECT id, name, bio FROM authors ORDER BY id",
+        &[
+            &["1", "J.R.R. Tolkien",    "Author of Middle-earth."],
+            &["2", "Frank Herbert",      "NULL"],
+            &["3", "Ursula K. Le Guin",  "NULL"],
+            &["4", "Cormac McCarthy",    "NULL"],
+        ],
+    );
+
+    // -----------------------------------------------------------------------
+    // String function — SUBSTRING + POSITION
+    //   Books where title contains a space (all except "Dune") → 6 rows
+    //   ORDER: heap/insertion order; WHERE filters Dune out
+    //   Expected titles & first words in insertion order:
+    //     The Hobbit                → The
+    //     The Lord of the Rings     → The
+    //     The Left Hand of Darkness → The
+    //     The Dispossessed          → The
+    //     Blood Meridian            → Blood
+    //     Children of Dune          → Children
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "SELECT title, SUBSTRING(title, 1, POSITION(' ' IN title) - 1) AS first_word
+         FROM books
+         WHERE POSITION(' ' IN title) > 0",
+        &[
+            &["The Hobbit",                 "The"],
+            &["The Lord of the Rings",      "The"],
+            &["The Left Hand of Darkness",  "The"],
+            &["The Dispossessed",           "The"],
+            &["Blood Meridian",             "Blood"],
+            &["Children of Dune",           "Children"],
+        ],
+    );
+
+    // -----------------------------------------------------------------------
+    // Window functions — ROW_NUMBER OVER (PARTITION BY author_id ORDER BY price DESC)
+    //   At this point prices: Blood Meridian=13.49, Dune=17.59, Children=15.39
+    //   (Gene Wolfe deleted; 4 authors × their books)
+    //   ORDER BY a.name, price_rank
+    //   Cormac McCarthy:   Blood Meridian 13.49 rank=1
+    //   Frank Herbert:     Dune 17.59 rank=1; Children of Dune 15.39 rank=2
+    //   J.R.R. Tolkien:    The Lord of the Rings 24.99 rank=1; The Hobbit 12.99 rank=2
+    //   Ursula K. Le Guin: The Left Hand of Darkness 13.99 rank=1; The Dispossessed 11.99 rank=2
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "SELECT a.name AS author, b.title, b.price,
+               ROW_NUMBER() OVER (PARTITION BY b.author_id ORDER BY b.price DESC) AS price_rank
+         FROM books b
+         JOIN authors a ON a.id = b.author_id
+         ORDER BY a.name, price_rank",
+        &[
+            &["Cormac McCarthy",   "Blood Meridian",              "13.49", "1"],
+            &["Frank Herbert",     "Dune",                        "17.59", "1"],
+            &["Frank Herbert",     "Children of Dune",            "15.39", "2"],
+            &["J.R.R. Tolkien",    "The Lord of the Rings",       "24.99", "1"],
+            &["J.R.R. Tolkien",    "The Hobbit",                  "12.99", "2"],
+            &["Ursula K. Le Guin", "The Left Hand of Darkness",   "13.99", "1"],
+            &["Ursula K. Le Guin", "The Dispossessed",            "11.99", "2"],
+        ],
+    );
+
+    // -----------------------------------------------------------------------
+    // WITH RECURSIVE series 1..5
+    // -----------------------------------------------------------------------
+    val(
+        &engine,
+        "WITH RECURSIVE series(n) AS (
+            SELECT 1
+            UNION ALL
+            SELECT n + 1 FROM series WHERE n < 5
+        )
+        SELECT n FROM series",
+        &[&["1"], &["2"], &["3"], &["4"], &["5"]],
+    );
 }

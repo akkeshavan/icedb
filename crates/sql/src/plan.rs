@@ -370,6 +370,12 @@ pub enum TransactionControlKind {
     Begin,
     Commit,
     Rollback,
+    /// SAVEPOINT <name> — session-level; executor treats as acknowledged no-op
+    Savepoint,
+    /// ROLLBACK TO [SAVEPOINT] <name> — session-level; executor treats as acknowledged no-op
+    RollbackToSavepoint,
+    /// RELEASE [SAVEPOINT] <name> — session-level; executor treats as acknowledged no-op
+    ReleaseSavepoint,
 }
 
 #[derive(Debug, Clone)]

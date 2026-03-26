@@ -22,7 +22,7 @@ icedb/
 │   ├── network/        # PostgreSQL wire protocol (pgwire crate)
 │   ├── auth/           # SCRAM-SHA-256, RBAC
 │   ├── server/         # Top-level server binary wiring all crates
-│   └── cli/            # nkv-psql CLI (rustyline)
+│   └── cli/            # isql CLI (rustyline)
 ├── drivers/
 │   ├── rust/           # Native Rust client crate
 │   ├── python/         # PyO3/Maturin Python bindings
@@ -67,7 +67,7 @@ cargo fmt --all
 cargo run -p server -- --port 5432 --data-dir ./data
 
 # Run the CLI
-cargo run -p cli -- --host localhost --port 5432 -U postgres
+cargo run -p cli -- --data-dir ./data -U icedb
 ```
 
 ## Key Dependencies
@@ -251,11 +251,11 @@ Client (psql / app driver)
 - [ ] `network`: Multi-statement batches; transaction control over wire
 - [ ] Integration test: connect with real `psql`, run CRUD, verify results
 
-**Gate**: `psql -h localhost -U postgres` connects and executes all basic SQL; `cargo test -p network` passes.
+**Gate**: `psql -h localhost -U icedb` connects and executes all basic SQL (icedb is PostgreSQL wire-protocol compatible); `cargo test -p network` passes.
 
 ---
 
-### Phase 8 — CLI (nkv-psql)
+### Phase 8 — CLI (isql)
 **Goal**: A psql-compatible interactive terminal.
 
 - [ ] `cli`: `rustyline`-based REPL with persistent history

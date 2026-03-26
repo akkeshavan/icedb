@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use catalog::manager::{AclPrivilege, CatalogManager};
 use parking_lot::Mutex;
+use storage::heap::HeapFile;
 use txn::manager::TransactionManager;
 use txn::transaction::IsolationLevel;
 use txn::xid::Xid;
@@ -14,7 +15,27 @@ use crate::optimizer::Optimizer;
 use crate::parser::{ParseResult, Parser};
 use crate::plan::LogicalPlan;
 use crate::planner::Planner;
+use crate::subtxn::{SavepointFrame, UndoEntry};
 use crate::value::Value;
+
+/// Per-session transaction state.  One entry per active session_id.
+struct SessionState {
+    xid: Xid,
+    /// Stack of active savepoints, innermost last.
+    savepoints: Vec<SavepointFrame>,
+    /// Shared undo log — populated by the executor, consumed on ROLLBACK TO SAVEPOINT.
+    undo_log: Arc<Mutex<Vec<UndoEntry>>>,
+}
+
+impl SessionState {
+    fn new(xid: Xid) -> Self {
+        Self {
+            xid,
+            savepoints: Vec::new(),
+            undo_log: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
 
 pub struct QueryEngine {
     pub txn_manager: Arc<TransactionManager>,
@@ -26,12 +47,8 @@ pub struct QueryEngine {
     pub current_role: Option<String>,
     /// Prepared statement cache: name → original SQL string
     prepared_statements: Mutex<HashMap<String, String>>,
-    /// Per-session open transactions (session_id → Xid).
-    /// Used by the wire protocol to support multi-statement transactions.
-    open_sessions: Mutex<HashMap<String, Xid>>,
-    /// Per-session savepoint stacks (session_id → Vec<savepoint_name>).
-    /// Each savepoint records the names defined within the current transaction.
-    session_savepoints: Mutex<HashMap<String, Vec<String>>>,
+    /// Per-session transaction state (session_id → SessionState).
+    session_states: Mutex<HashMap<String, SessionState>>,
 }
 
 impl QueryEngine {
@@ -56,8 +73,7 @@ impl QueryEngine {
             db_name,
             current_role: None,
             prepared_statements: Mutex::new(HashMap::new()),
-            open_sessions: Mutex::new(HashMap::new()),
-            session_savepoints: Mutex::new(HashMap::new()),
+            session_states: Mutex::new(HashMap::new()),
         }
     }
 
@@ -177,12 +193,22 @@ impl QueryEngine {
 
     /// Execute SQL in the context of an existing transaction.
     pub fn execute_in_txn(&self, xid: Xid, sql: &str) -> Result<ExecutionResult, SqlError> {
+        self.execute_in_txn_inner(xid, sql, None)
+    }
+
+    fn execute_in_txn_inner(
+        &self,
+        xid: Xid,
+        sql: &str,
+        undo_sink: Option<Arc<Mutex<Vec<UndoEntry>>>>,
+    ) -> Result<ExecutionResult, SqlError> {
         let ctx = Arc::new(ExecutionContext {
             xid,
             data_dir: self.data_dir.clone(),
             db_name: self.db_name.clone(),
             txn_manager: Arc::clone(&self.txn_manager),
             catalog: Arc::clone(&self.catalog),
+            undo_sink,
         });
         let executor = Executor::new(ctx);
 
@@ -500,9 +526,10 @@ impl QueryEngine {
 
         // BEGIN / START TRANSACTION
         if sql_upper == "BEGIN" || sql_upper.starts_with("BEGIN ") || sql_upper.starts_with("START TRANSACTION") {
-            if !self.open_sessions.lock().contains_key(session_id) {
+            let mut states = self.session_states.lock();
+            if !states.contains_key(session_id) {
                 let xid = self.txn_manager.begin(IsolationLevel::ReadCommitted);
-                self.open_sessions.lock().insert(session_id.to_string(), xid);
+                states.insert(session_id.to_string(), SessionState::new(xid));
             }
             return Ok(ExecutionResult {
                 rows: vec![], rows_affected: 0,
@@ -512,25 +539,23 @@ impl QueryEngine {
 
         // COMMIT / END
         if sql_upper == "COMMIT" || sql_upper.starts_with("COMMIT ") || sql_upper == "END" || sql_upper.starts_with("END ") {
-            if let Some(xid) = self.open_sessions.lock().remove(session_id) {
-                self.txn_manager.commit(xid)?;
+            if let Some(state) = self.session_states.lock().remove(session_id) {
+                self.txn_manager.commit(state.xid)?;
             }
-            self.session_savepoints.lock().remove(session_id);
             return Ok(ExecutionResult {
                 rows: vec![], rows_affected: 0,
                 command: "COMMIT".to_string(), col_names: vec![], col_types: vec![],
             });
         }
 
-        // ROLLBACK / ABORT
+        // ROLLBACK / ABORT  (but NOT "ROLLBACK TO ...")
         if sql_upper == "ROLLBACK" || sql_upper == "ABORT"
             || (sql_upper.starts_with("ROLLBACK ") && !sql_upper.starts_with("ROLLBACK TO"))
             || sql_upper.starts_with("ABORT ")
         {
-            if let Some(xid) = self.open_sessions.lock().remove(session_id) {
-                let _ = self.txn_manager.abort(xid);
+            if let Some(state) = self.session_states.lock().remove(session_id) {
+                let _ = self.txn_manager.abort(state.xid);
             }
-            self.session_savepoints.lock().remove(session_id);
             return Ok(ExecutionResult {
                 rows: vec![], rows_affected: 0,
                 command: "ROLLBACK".to_string(), col_names: vec![], col_types: vec![],
@@ -540,15 +565,14 @@ impl QueryEngine {
         // SAVEPOINT <name>
         if sql_upper.starts_with("SAVEPOINT ") {
             let sp_name = sql_trimmed["SAVEPOINT ".len()..].trim().trim_matches('"').to_string();
-            // Ensure there's an open transaction
-            if !self.open_sessions.lock().contains_key(session_id) {
+            let mut states = self.session_states.lock();
+            // Ensure there's an open transaction.
+            let state = states.entry(session_id.to_string()).or_insert_with(|| {
                 let xid = self.txn_manager.begin(IsolationLevel::ReadCommitted);
-                self.open_sessions.lock().insert(session_id.to_string(), xid);
-            }
-            self.session_savepoints.lock()
-                .entry(session_id.to_string())
-                .or_default()
-                .push(sp_name);
+                SessionState::new(xid)
+            });
+            let start = state.undo_log.lock().len();
+            state.savepoints.push(SavepointFrame { name: sp_name, undo_log_start: start });
             return Ok(ExecutionResult {
                 rows: vec![], rows_affected: 0,
                 command: "SAVEPOINT".to_string(), col_names: vec![], col_types: vec![],
@@ -560,24 +584,26 @@ impl QueryEngine {
             let rest = sql_trimmed["ROLLBACK TO ".len()..].trim();
             let sp_name = rest.strip_prefix("SAVEPOINT ").unwrap_or(rest)
                 .trim().trim_matches('"').to_string();
-            let mut savepoints = self.session_savepoints.lock();
-            let stack = savepoints.entry(session_id.to_string()).or_default();
-            // Check savepoint exists
-            if !stack.contains(&sp_name) {
-                return Err(SqlError::Execution(format!("savepoint \"{sp_name}\" does not exist")));
-            }
-            // Pop savepoints after the target (keep the named one)
-            if let Some(pos) = stack.iter().rposition(|s| s == &sp_name) {
-                stack.truncate(pos + 1);
-            }
-            // Abort current txn and start a new one (data since BEGIN is lost;
-            // full subtransaction support would require page-level undo)
-            drop(savepoints);
-            if let Some(xid) = self.open_sessions.lock().remove(session_id) {
-                let _ = self.txn_manager.abort(xid);
-            }
-            let new_xid = self.txn_manager.begin(IsolationLevel::ReadCommitted);
-            self.open_sessions.lock().insert(session_id.to_string(), new_xid);
+
+            // Extract what we need while holding the lock, then release it before doing IO.
+            let (xid, entries) = {
+                let mut states = self.session_states.lock();
+                let state = states.get_mut(session_id)
+                    .ok_or_else(|| SqlError::Execution(format!("savepoint \"{sp_name}\" does not exist")))?;
+
+                let pos = state.savepoints.iter().rposition(|f| f.name == sp_name)
+                    .ok_or_else(|| SqlError::Execution(format!("savepoint \"{sp_name}\" does not exist")))?;
+
+                let undo_start = state.savepoints[pos].undo_log_start;
+                let entries: Vec<UndoEntry> = state.undo_log.lock().drain(undo_start..).collect();
+                // Keep savepoints up to and including the named one (it can be re-used).
+                state.savepoints.truncate(pos + 1);
+                (state.xid, entries)
+            };
+
+            // Apply undo entries in reverse — no lock held during IO.
+            self.apply_undo_entries(xid, &entries)?;
+
             return Ok(ExecutionResult {
                 rows: vec![], rows_affected: 0,
                 command: "ROLLBACK".to_string(), col_names: vec![], col_types: vec![],
@@ -589,14 +615,17 @@ impl QueryEngine {
             let rest = sql_trimmed["RELEASE ".len()..].trim();
             let sp_name = rest.strip_prefix("SAVEPOINT ").unwrap_or(rest)
                 .trim().trim_matches('"').to_string();
-            let mut savepoints = self.session_savepoints.lock();
-            let stack = savepoints.entry(session_id.to_string()).or_default();
-            if let Some(pos) = stack.iter().rposition(|s| s == &sp_name) {
-                stack.remove(pos);
-                return Ok(ExecutionResult {
-                    rows: vec![], rows_affected: 0,
-                    command: "RELEASE".to_string(), col_names: vec![], col_types: vec![],
-                });
+            let mut states = self.session_states.lock();
+            if let Some(state) = states.get_mut(session_id) {
+                if let Some(pos) = state.savepoints.iter().rposition(|f| f.name == sp_name) {
+                    // Merge the released savepoint's undo range into the parent frame
+                    // (entries stay in the log so a parent ROLLBACK TO can still undo them).
+                    state.savepoints.remove(pos);
+                    return Ok(ExecutionResult {
+                        rows: vec![], rows_affected: 0,
+                        command: "RELEASE".to_string(), col_names: vec![], col_types: vec![],
+                    });
+                }
             }
             return Err(SqlError::Execution(format!("savepoint \"{sp_name}\" does not exist")));
         }
@@ -609,14 +638,18 @@ impl QueryEngine {
             });
         }
 
-        // Use session transaction if one is open, otherwise auto-commit
-        let open_xid = self.open_sessions.lock().get(session_id).copied();
-        if let Some(xid) = open_xid {
-            match self.execute_in_txn(xid, sql) {
+        // Use session transaction if one is open, otherwise auto-commit.
+        let session_xid_sink = {
+            let states = self.session_states.lock();
+            states.get(session_id).map(|s| (s.xid, Arc::clone(&s.undo_log)))
+        };
+        if let Some((xid, undo_log)) = session_xid_sink {
+            match self.execute_in_txn_inner(xid, sql, Some(undo_log)) {
                 Ok(result) => Ok(result),
                 Err(e) => {
-                    self.open_sessions.lock().remove(session_id);
-                    let _ = self.txn_manager.abort(xid);
+                    if let Some(state) = self.session_states.lock().remove(session_id) {
+                        let _ = self.txn_manager.abort(state.xid);
+                    }
                     Err(e)
                 }
             }
@@ -627,9 +660,33 @@ impl QueryEngine {
 
     /// Abort any open session transaction (called on connection drop).
     pub fn abort_session(&self, session_id: &str) {
-        if let Some(xid) = self.open_sessions.lock().remove(session_id) {
-            let _ = self.txn_manager.abort(xid);
+        if let Some(state) = self.session_states.lock().remove(session_id) {
+            let _ = self.txn_manager.abort(state.xid);
         }
+    }
+
+    /// Apply a list of undo entries in reverse order to restore pre-savepoint state.
+    ///
+    /// Called by `ROLLBACK TO SAVEPOINT`.  The transaction XID is kept alive —
+    /// only the specific tuple changes made after the savepoint are reversed.
+    fn apply_undo_entries(&self, xid: Xid, entries: &[UndoEntry]) -> Result<(), SqlError> {
+        for entry in entries.iter().rev() {
+            match entry {
+                UndoEntry::Insert { table_oid, tid } => {
+                    let path = self.data_dir.join(format!("{table_oid}.heap"));
+                    let mut heap = HeapFile::open(&path)
+                        .map_err(|e| SqlError::Storage(storage::error::StorageError::Heap(e)))?;
+                    self.txn_manager.undo_insert(xid, &mut heap, *tid)?;
+                }
+                UndoEntry::Delete { table_oid, tid } => {
+                    let path = self.data_dir.join(format!("{table_oid}.heap"));
+                    let mut heap = HeapFile::open(&path)
+                        .map_err(|e| SqlError::Storage(storage::error::StorageError::Heap(e)))?;
+                    self.txn_manager.undo_delete(xid, &mut heap, *tid)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Execute SQL, auto-committing (begin → execute → commit/rollback).
@@ -654,9 +711,20 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
     let mut stmts = Vec::new();
     let mut current = String::new();
     let mut in_single_quote = false;
+    let mut chars = sql.chars().peekable();
 
-    for ch in sql.chars() {
+    while let Some(ch) = chars.next() {
         match ch {
+            // Strip -- line comments so that apostrophes inside comments
+            // (e.g. "Alice's") don't corrupt single-quote tracking.
+            '-' if !in_single_quote && chars.peek() == Some(&'-') => {
+                chars.next(); // consume second '-'
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
             '\'' => {
                 in_single_quote = !in_single_quote;
                 current.push(ch);

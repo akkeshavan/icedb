@@ -54,7 +54,7 @@ cargo build --release -p server -p cli
 ./target/release/icedb-server --port 5432 --data-dir ./data
 
 # 4. Connect (in a second terminal)
-./target/release/nkv-psql --data-dir ./data
+./target/release/isql --data-dir ./data
 ```
 
 ---
@@ -204,7 +204,7 @@ cd icedb
 cargo build --workspace --release
 ```
 
-Build output: `target\release\icedb-server.exe` and `target\release\nkv-psql.exe`.
+Build output: `target\release\icedb-server.exe` and `target\release\isql.exe`.
 
 #### 4. (Optional) Admin UI
 
@@ -268,10 +268,10 @@ kill $(cat icedb.pid)
 
 ## Connecting with the built-in CLI
 
-The CLI (`nkv-psql`) embeds the storage engine directly — no TCP connection or separate server is needed for local development:
+The CLI (`isql`) embeds the storage engine directly — no TCP connection or separate server is needed for local development:
 
 ```sh
-./target/release/nkv-psql --data-dir ./data
+./target/release/isql --data-dir ./data
 ```
 
 ```

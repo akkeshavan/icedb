@@ -45,7 +45,7 @@ fn main() {
         Arc::clone(&txn_manager),
         Arc::clone(&catalog),
         data_dir.clone(),
-    ));
+    ).with_role(config.username.clone()));
 
     let db_manager = Arc::new(sql::DatabaseManager::new(data_dir));
     db_manager.register_engine("icedb", Arc::clone(&engine));
@@ -58,14 +58,14 @@ fn main() {
 }
 
 fn print_usage() {
-    println!("nkv-psql - icedb interactive terminal");
+    println!("isql - icedb interactive terminal");
     println!();
     println!("Usage:");
-    println!("  nkv-psql [OPTIONS]");
+    println!("  isql [OPTIONS]");
     println!();
     println!("Options:");
     println!("  --data-dir DIR    Data directory (default: ./data)");
-    println!("  --user, -U USER   Username (default: postgres, or $PGUSER)");
+    println!("  --user, -U USER   Username (default: icedb, or $PGUSER)");
     println!("  --dbname, -d DB   Database name (default: username, or $PGDATABASE)");
     println!("  --help, -h        Show this help");
 }

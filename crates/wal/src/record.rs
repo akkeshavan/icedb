@@ -157,6 +157,16 @@ impl WalRecord {
         }
 
         let total_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        // total_len must be at least FIXED_HEADER_LEN + CRC_LEN to be valid.
+        // Checking this before the subtraction below prevents a usize underflow.
+        if total_len < FIXED_HEADER_LEN + CRC_LEN {
+            return Err(WalError::CorruptRecord {
+                lsn: INVALID_LSN,
+                reason: format!(
+                    "total_len field ({total_len}) smaller than minimum record size"
+                ),
+            });
+        }
         if bytes.len() < total_len {
             return Err(WalError::CorruptRecord {
                 lsn: INVALID_LSN,

@@ -280,7 +280,7 @@ Therefore, in the current implementation:
 
 | Role | Login | Create DB | Create Role | Superuser |
 |---|---|---|---|---|
-| postgres | Yes | Yes | Yes | Yes |
+| icedb    | Yes | Yes | Yes | Yes |
 | app_user | Yes | No | No | No |
 
 **Planned (Phase 4 of admin UI — after engine support is added)**:
@@ -568,7 +568,7 @@ Response `200 OK`:
   "roles": [
     {
       "oid": 10,
-      "rolname": "postgres",
+      "rolname": "icedb",
       "rolsuper": true,
       "rolinherit": true,
       "rolcreaterole": true,
@@ -676,14 +676,14 @@ Response `200 OK`:
       "oid": 2200,
       "nspname": "public",
       "nspowner": 10,
-      "nspowner_name": "postgres",
+      "nspowner_name": "icedb",
       "table_count": 5
     },
     {
       "oid": 11,
       "nspname": "pg_catalog",
       "nspowner": 10,
-      "nspowner_name": "postgres",
+      "nspowner_name": "icedb",
       "table_count": 4,
       "system": true
     }
@@ -875,7 +875,7 @@ Response `200 OK`:
   "acl_tracking_available": false,
   "role_capabilities": [
     {
-      "rolname": "postgres",
+      "rolname": "icedb",
       "rolsuper": true,
       "rolcanlogin": true,
       "rolcreatedb": true,

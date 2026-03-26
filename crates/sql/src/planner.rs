@@ -205,8 +205,21 @@ impl Planner {
             Statement::Commit { .. } => Ok(LogicalPlan::TransactionControl {
                 kind: crate::plan::TransactionControlKind::Commit,
             }),
-            Statement::Rollback { .. } => Ok(LogicalPlan::TransactionControl {
-                kind: crate::plan::TransactionControlKind::Rollback,
+            Statement::Rollback { savepoint, .. } => Ok(LogicalPlan::TransactionControl {
+                kind: if savepoint.is_some() {
+                    crate::plan::TransactionControlKind::RollbackToSavepoint
+                } else {
+                    crate::plan::TransactionControlKind::Rollback
+                },
+            }),
+            // Savepoint management — real semantics handled at session level;
+            // if these reach the planner inside a multi-statement batch the
+            // executor acknowledges them gracefully instead of returning an error.
+            Statement::Savepoint { .. } => Ok(LogicalPlan::TransactionControl {
+                kind: crate::plan::TransactionControlKind::Savepoint,
+            }),
+            Statement::ReleaseSavepoint { .. } => Ok(LogicalPlan::TransactionControl {
+                kind: crate::plan::TransactionControlKind::ReleaseSavepoint,
             }),
             Statement::Grant {
                 privileges,
@@ -560,6 +573,20 @@ impl Planner {
                 } else {
                     vec![]
                 };
+                // Build a lookup of SELECT-list aliases so ORDER BY can reference them.
+                // e.g. SELECT LENGTH(name) AS chars ... ORDER BY chars DESC
+                let proj_alias_lookup: Vec<(String, &ast::Expr)> = select
+                    .projection
+                    .iter()
+                    .filter_map(|item| {
+                        if let ast::SelectItem::ExprWithAlias { expr, alias } = item {
+                            Some((alias.value.to_lowercase(), expr))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
                 let keys = order_by
                     .exprs
                     .iter()
@@ -574,7 +601,38 @@ impl Planner {
                                 .unwrap_or_else(|| expr_to_name(&o.expr));
                             Expr::Column { table: None, name: col_name }
                         } else {
-                            self.convert_expr_with_schema(&o.expr, agg_output_schema.as_ref())?
+                            // Check if the ORDER BY expression is a bare alias name from
+                            // the SELECT list (PostgreSQL allows ORDER BY alias).
+                            // Only apply alias expansion for non-aggregate queries
+                            // (projection.is_some()); for aggregate queries the alias is
+                            // already a real column in the aggregate output schema.
+                            let alias_expr = if projection.is_some() {
+                                if let ast::Expr::Identifier(ident) = &o.expr {
+                                    let name_lower = ident.value.to_lowercase();
+                                    proj_alias_lookup.iter().find_map(|(alias, src_expr)| {
+                                        if *alias != name_lower {
+                                            return None;
+                                        }
+                                        // Window function aliases are computed during
+                                        // projection; the alias is already a column in
+                                        // the post-projection schema, so don't expand it
+                                        // here — fall through to the column-reference path.
+                                        if is_window_function_expr(src_expr) {
+                                            return None;
+                                        }
+                                        self.convert_expr_with_schema(src_expr, agg_output_schema.as_ref()).ok()
+                                    })
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            if let Some(e) = alias_expr {
+                                e
+                            } else {
+                                self.convert_expr_with_schema(&o.expr, agg_output_schema.as_ref())?
+                            }
                         };
                         let ascending = o.asc.unwrap_or(true);
                         let nulls_first = o.nulls_first.unwrap_or(!ascending);
@@ -3105,6 +3163,16 @@ fn convert_binary_op(op: &BinaryOperator) -> Result<BinaryOp, SqlError> {
         BinaryOperator::StringConcat => Ok(BinaryOp::Concat),
         BinaryOperator::Modulo => Ok(BinaryOp::Mod),
         _ => Err(SqlError::NotImplemented(format!("binary op: {op}"))),
+    }
+}
+
+/// Returns true if `expr` is a window function call (has an OVER clause).
+/// Used to skip alias expansion for window function aliases in ORDER BY;
+/// the alias is already materialised as a column by the projection.
+fn is_window_function_expr(expr: &AstExpr) -> bool {
+    match expr {
+        AstExpr::Function(f) => f.over.is_some(),
+        _ => false,
     }
 }
 

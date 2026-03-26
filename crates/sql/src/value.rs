@@ -335,6 +335,31 @@ impl PartialOrd for Value {
                     _ => a.partial_cmp(b),
                 }
             }
+            // Cross-type comparisons involving Numeric
+            (Value::Numeric(a), Value::Int4(b)) => match a.parse::<f64>() {
+                Ok(fa) => fa.partial_cmp(&(*b as f64)),
+                _ => None,
+            },
+            (Value::Numeric(a), Value::Int8(b)) => match a.parse::<f64>() {
+                Ok(fa) => fa.partial_cmp(&(*b as f64)),
+                _ => None,
+            },
+            (Value::Numeric(a), Value::Float8(b)) => match a.parse::<f64>() {
+                Ok(fa) => fa.partial_cmp(b),
+                _ => None,
+            },
+            (Value::Int4(a), Value::Numeric(b)) => match b.parse::<f64>() {
+                Ok(fb) => (*a as f64).partial_cmp(&fb),
+                _ => None,
+            },
+            (Value::Int8(a), Value::Numeric(b)) => match b.parse::<f64>() {
+                Ok(fb) => (*a as f64).partial_cmp(&fb),
+                _ => None,
+            },
+            (Value::Float8(a), Value::Numeric(b)) => match b.parse::<f64>() {
+                Ok(fb) => a.partial_cmp(&fb),
+                _ => None,
+            },
             (Value::Uuid(a), Value::Uuid(b)) => a.partial_cmp(b),
             _ => None,
         }

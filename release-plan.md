@@ -7,7 +7,7 @@ The project has 5 distinct deliverables, each with its own distribution channel:
 | Artifact | Binary/Package | Distribution |
 |---|---|---|
 | `icedb-server` | Standalone binary | GitHub Releases, Homebrew, apt, winget |
-| `nkv-psql` (CLI) | Standalone binary | Same as server |
+| `isql` (CLI) | Standalone binary | Same as server |
 | Rust driver (`icedb-driver`) | Crate | crates.io |
 | Python driver | Wheel (`.whl`) | PyPI via maturin |
 | Node.js driver | Native addon | npm |
@@ -37,7 +37,7 @@ Pre-compiled binaries for these 5 targets:
 | `x86_64-pc-windows-msvc` | Windows |
 
 A GitHub Actions **matrix workflow** runs on push of a version tag:
-- Compiles `icedb-server` and `nkv-psql` with `cargo build --release`
+- Compiles `icedb-server` and `isql` with `cargo build --release`
 - Zips each binary with `tar.gz` (Linux/Mac) or `.zip` (Windows)
 - Uploads all artifacts to a **GitHub Release** automatically
 
@@ -56,7 +56,7 @@ icedb-v0.1.0-aarch64-unknown-linux-gnu.tar.gz
 icedb-v0.1.0-x86_64-pc-windows-msvc.zip
 ```
 
-Each archive contains `icedb-server` and `nkv-psql`.
+Each archive contains `icedb-server` and `isql`.
 
 ---
 

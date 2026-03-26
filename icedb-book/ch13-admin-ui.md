@@ -20,7 +20,7 @@ The icedb Admin UI is a localhost web application for database administration. I
 
 ### When to use it vs the CLI
 
-The `nkv-psql` CLI (Chapter 8) is for SQL work: writing queries, running DML, testing transactions. The Admin UI is for administration:
+The `isql` CLI (Chapter 8) is for SQL work: writing queries, running DML, testing transactions. The Admin UI is for administration:
 
 - Inspecting and managing roles without remembering SQL syntax
 - Browsing table schemas and index definitions at a glance
@@ -219,7 +219,7 @@ The UI surfaces this as an error message.
 
 ### Editing a role
 
-The `PUT /api/roles/:name` endpoint exists and accepts `password`, `rolsuper`, and `rolcanlogin`. The UI does not currently expose an edit form. To update a role's password or flags after creation, use the Query Console or the `nkv-psql` CLI:
+The `PUT /api/roles/:name` endpoint exists and accepts `password`, `rolsuper`, and `rolcanlogin`. The UI does not currently expose an edit form. To update a role's password or flags after creation, use the Query Console or the `isql` CLI:
 
 ```sql
 ALTER ROLE alice WITH PASSWORD 'newpassword';

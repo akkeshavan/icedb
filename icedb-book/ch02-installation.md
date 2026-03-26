@@ -58,9 +58,9 @@ Compiled binaries land in `target/debug/`:
 | Binary | Description |
 |--------|-------------|
 | `target/debug/icedb-server` | The icedb server process |
-| `target/debug/nkv-psql` | The `nkv-psql` interactive terminal |
+| `target/debug/isql` | The `isql` interactive terminal |
 
-The Cargo crate names are `server` and `cli` (used with `cargo run -p server` and `cargo run -p cli`). The compiled binary names are `icedb-server` and `nkv-psql` respectively, as declared in the `[[bin]]` sections of each crate's `Cargo.toml`.
+The Cargo crate names are `server` and `cli` (used with `cargo run -p server` and `cargo run -p cli`). The compiled binary names are `icedb-server` and `isql` respectively, as declared in the `[[bin]]` sections of each crate's `Cargo.toml`.
 
 ### Release Build
 
@@ -78,7 +78,7 @@ If you only need one binary (use the crate name with `-p`):
 
 ```sh
 cargo build -p server --release   # produces target/release/icedb-server
-cargo build -p cli --release      # produces target/release/nkv-psql
+cargo build -p cli --release      # produces target/release/isql
 ```
 
 ## Running the Test Suite
@@ -134,10 +134,10 @@ icedb/
 ├── target/
 │   ├── debug/
 │   │   ├── icedb-server    ← debug server binary
-│   │   └── nkv-psql        ← debug CLI binary
+│   │   └── isql        ← debug CLI binary
 │   └── release/
 │       ├── icedb-server    ← release server binary
-│       └── nkv-psql        ← release CLI binary
+│       └── isql        ← release CLI binary
 ├── crates/                 ← all Rust library crates
 ├── drivers/                ← cross-language driver crates
 ├── docs/                   ← internal specs

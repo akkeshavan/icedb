@@ -22,6 +22,11 @@ pub struct ExecutionContext {
     pub db_name: String,
     pub txn_manager: Arc<TransactionManager>,
     pub catalog: Arc<CatalogManager>,
+    /// Shared undo log for the current session transaction.
+    /// When `Some`, every DML operation appends an `UndoEntry` so that
+    /// `ROLLBACK TO SAVEPOINT` can reverse individual changes.
+    /// `None` for auto-commit statements (no savepoint tracking needed).
+    pub undo_sink: Option<Arc<parking_lot::Mutex<Vec<crate::subtxn::UndoEntry>>>>,
 }
 
 #[derive(Debug)]
@@ -54,6 +59,14 @@ pub struct Executor {
 impl Executor {
     pub fn new(ctx: Arc<ExecutionContext>) -> Self {
         Self { ctx, cte_context: std::cell::RefCell::new(HashMap::new()) }
+    }
+
+    /// Append an undo entry to the session undo log, if one is active.
+    #[inline]
+    fn record_undo(&self, entry: crate::subtxn::UndoEntry) {
+        if let Some(sink) = &self.ctx.undo_sink {
+            sink.lock().push(entry);
+        }
     }
 
     pub fn execute(&self, plan: LogicalPlan) -> Result<ExecutionResult, SqlError> {
@@ -324,6 +337,9 @@ impl Executor {
                     crate::plan::TransactionControlKind::Begin => "BEGIN",
                     crate::plan::TransactionControlKind::Commit => "COMMIT",
                     crate::plan::TransactionControlKind::Rollback => "ROLLBACK",
+                    crate::plan::TransactionControlKind::Savepoint => "SAVEPOINT",
+                    crate::plan::TransactionControlKind::RollbackToSavepoint => "ROLLBACK",
+                    crate::plan::TransactionControlKind::ReleaseSavepoint => "RELEASE",
                 };
                 Ok(ExecutionResult {
                     rows: vec![],
@@ -625,9 +641,7 @@ impl Executor {
                     .schema
                     .iter()
                     .map(|(col_name, col_type)| {
-                        let qualified = if alias.is_empty() {
-                            col_name.clone()
-                        } else if col_name.contains('.') {
+                        let qualified = if alias.is_empty() || col_name.contains('.') {
                             col_name.clone()
                         } else {
                             format!("{alias}.{col_name}")
@@ -1439,7 +1453,9 @@ impl Executor {
                                                             let (new_data, new_bitmap) = encode_row(&updated_row);
                                                             let mut full = new_bitmap.to_le_bytes().to_vec();
                                                             full.extend_from_slice(&new_data);
-                                                            self.ctx.txn_manager.update_tuple(self.ctx.xid, &mut heap, *tid, &full)?;
+                                                            let new_tid = self.ctx.txn_manager.update_tuple(self.ctx.xid, &mut heap, *tid, &full)?;
+                                                            self.record_undo(crate::subtxn::UndoEntry::Delete { table_oid, tid: *tid });
+                                                            self.record_undo(crate::subtxn::UndoEntry::Insert { table_oid, tid: new_tid });
                                                             count += 1;
                                                             if !returning.is_empty() {
                                                                 returning_rows.push(self.build_returning_row(&updated_row, returning)?);
@@ -1481,9 +1497,10 @@ impl Executor {
             let mut full_data = null_bitmap.to_le_bytes().to_vec();
             full_data.extend_from_slice(&data);
 
-            self.ctx
+            let tid = self.ctx
                 .txn_manager
                 .insert_tuple(self.ctx.xid, &mut heap, &full_data)?;
+            self.record_undo(crate::subtxn::UndoEntry::Insert { table_oid, tid });
             count += 1;
 
             // Build RETURNING row
@@ -1622,9 +1639,11 @@ impl Executor {
             let mut full_data = null_bitmap.to_le_bytes().to_vec();
             full_data.extend_from_slice(&data);
 
-            self.ctx
+            let new_tid = self.ctx
                 .txn_manager
                 .update_tuple(self.ctx.xid, &mut heap, tid, &full_data)?;
+            self.record_undo(crate::subtxn::UndoEntry::Delete { table_oid: schema.oid, tid });
+            self.record_undo(crate::subtxn::UndoEntry::Insert { table_oid: schema.oid, tid: new_tid });
 
             if !returning.is_empty() {
                 returning_rows.push(self.build_returning_row(&row, returning)?);
@@ -1730,8 +1749,8 @@ impl Executor {
                                                             let nb = if cd.len() >= 4 { u32::from_le_bytes(cd[0..4].try_into().unwrap()) } else { 0 };
                                                             let rd = if cd.len() >= 4 { &cd[4..] } else { cd };
                                                             if let Ok(cr) = crate::codec::decode_row(rd, nb, &child_schema) {
-                                                                if cr.values == child_row.values {
-                                                                    let _ = self.ctx.txn_manager.delete_tuple(self.ctx.xid, &mut child_heap, *child_tid);
+                                                                if cr.values == child_row.values && self.ctx.txn_manager.delete_tuple(self.ctx.xid, &mut child_heap, *child_tid).is_ok() {
+                                                                        self.record_undo(crate::subtxn::UndoEntry::Delete { table_oid: child_schema.oid, tid: *child_tid });
                                                                 }
                                                             }
                                                         }
@@ -1751,7 +1770,10 @@ impl Executor {
                                                                         let (enc, nbm) = encode_row(&cr2);
                                                                         let mut data = nbm.to_le_bytes().to_vec();
                                                                         data.extend_from_slice(&enc);
-                                                                        let _ = self.ctx.txn_manager.update_tuple(self.ctx.xid, &mut child_heap, *child_tid2, &data);
+                                                                        if let Ok(new_tid2) = self.ctx.txn_manager.update_tuple(self.ctx.xid, &mut child_heap, *child_tid2, &data) {
+                                                                            self.record_undo(crate::subtxn::UndoEntry::Delete { table_oid: child_schema.oid, tid: *child_tid2 });
+                                                                            self.record_undo(crate::subtxn::UndoEntry::Insert { table_oid: child_schema.oid, tid: new_tid2 });
+                                                                        }
                                                                     }
                                                                 }
                                                             }
@@ -1778,6 +1800,7 @@ impl Executor {
             self.ctx
                 .txn_manager
                 .delete_tuple(self.ctx.xid, &mut heap, tid)?;
+            self.record_undo(crate::subtxn::UndoEntry::Delete { table_oid, tid });
 
             if !returning.is_empty() {
                 returning_rows.push(self.build_returning_row(&row, returning)?);
@@ -4627,7 +4650,7 @@ impl Executor {
                         vec![
                             Value::Text("icedb".into()),
                             Value::Text(ns.nspname.clone()),
-                            Value::Text("postgres".into()),
+                            Value::Text("icedb".into()),
                         ],
                         schema_cols.clone(),
                     ));
@@ -4853,7 +4876,7 @@ impl Executor {
                         vec![
                             Value::Text("public".into()),
                             Value::Text(tbl),
-                            Value::Text("postgres".into()),
+                            Value::Text("icedb".into()),
                             Value::Bool(has_idx),
                             Value::Bool(false),
                             Value::Bool(false),
@@ -5446,9 +5469,55 @@ fn checked_numeric_op(
                 .map(Value::Int8)
                 .ok_or_else(|| SqlError::NumericOverflow(format!("{a} op {b}")))
         }
-        _ => Err(SqlError::TypeError(format!(
-            "arithmetic type mismatch: {left:?} vs {right:?}"
-        ))),
+        // Any expression involving Numeric is promoted to f64, result stays Numeric.
+        // This handles expressions like `balance - 100` where balance is NUMERIC(12,2).
+        _ => {
+            let lf = numeric_to_f64(&left)
+                .ok_or_else(|| SqlError::TypeError(format!(
+                    "arithmetic type mismatch: {left:?} vs {right:?}"
+                )))?;
+            let rf = numeric_to_f64(&right)
+                .ok_or_else(|| SqlError::TypeError(format!(
+                    "arithmetic type mismatch: {left:?} vs {right:?}"
+                )))?;
+            let result = op_f64(lf, rf);
+            // If either operand was Numeric, keep the result as Numeric.
+            // Otherwise (both are exotic types that happen to reach here), use Float8.
+            if matches!(&left, Value::Numeric(_)) || matches!(&right, Value::Numeric(_)) {
+                Ok(Value::Numeric(format_numeric(result)))
+            } else {
+                Ok(Value::Float8(result))
+            }
+        }
+    }
+}
+
+/// Try to convert any numeric Value variant to f64.
+fn numeric_to_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int4(i) => Some(*i as f64),
+        Value::Int8(i) => Some(*i as f64),
+        Value::Float8(f) => Some(*f),
+        Value::Numeric(s) => s.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// Format a f64 as a decimal string suitable for storage in a Numeric column.
+/// Produces the shortest representation that round-trips (no trailing ".0" for integers,
+/// but preserves fractional digits when present).
+fn format_numeric(f: f64) -> String {
+    // Use Rust's default Display, which gives shortest round-trip representation.
+    // E.g. 900.0 → "900", 13.49 → "13.49", 17.590000000000003 → handled by rounding below.
+    // Round to 10 significant decimal places to suppress f64 noise.
+    let s = format!("{:.10}", f);
+    // Strip trailing zeros after decimal point.
+    if s.contains('.') {
+        let s = s.trim_end_matches('0');
+        let s = s.trim_end_matches('.');
+        s.to_string()
+    } else {
+        s
     }
 }
 

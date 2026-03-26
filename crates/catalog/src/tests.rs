@@ -75,7 +75,7 @@ fn test_pg_authid_encode_decode() {
     // Without password
     let row = PgAuthidRow {
         oid: OID_ROLE_SUPERUSER,
-        rolname: "postgres".to_string(),
+        rolname: "icedb".to_string(),
         rolsuper: true,
         rolinherit: true,
         rolcreaterole: true,
@@ -121,7 +121,7 @@ fn test_catalog_bootstrap() {
     assert!(ns_err.is_ok(), "pg_catalog namespace should exist");
 
     // Superuser role exists
-    let role = mgr.get_role("postgres").unwrap();
+    let role = mgr.get_role("icedb").unwrap();
     assert!(role.rolsuper);
     assert!(role.rolcanlogin);
     assert_eq!(role.oid, OID_ROLE_SUPERUSER);

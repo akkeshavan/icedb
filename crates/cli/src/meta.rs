@@ -12,6 +12,7 @@ pub enum MetaCommand {
     Describe(String), // \d tablename
     Timing,           // \timing (toggle)
     ExpandedOutput,   // \x (toggle)
+    ResetBuffer,      // \r — discard pending query buffer
 }
 
 pub fn parse_meta_command(input: &str) -> Result<MetaCommand, CliError> {
@@ -37,6 +38,9 @@ pub fn parse_meta_command(input: &str) -> Result<MetaCommand, CliError> {
     if input == "\\x" {
         return Ok(MetaCommand::ExpandedOutput);
     }
+    if input == "\\r" || input == "\\reset" {
+        return Ok(MetaCommand::ResetBuffer);
+    }
     if let Some(table_name) = input.strip_prefix("\\d ") {
         return Ok(MetaCommand::Describe(table_name.trim().to_string()));
     }
@@ -60,6 +64,7 @@ pub fn execute_meta_command(
     match cmd {
         MetaCommand::Quit => Ok("\\q".to_string()),  // caller handles quit
         MetaCommand::Help => Ok(HELP_TEXT.to_string()),
+        MetaCommand::ResetBuffer => Ok("\\r".to_string()), // caller clears buffer
         MetaCommand::Timing => {
             *timing = !*timing;
             Ok(format!("Timing is {}.\n", if *timing { "on" } else { "off" }))
@@ -87,7 +92,7 @@ pub fn execute_meta_command(
             }
         }
         MetaCommand::ListRoles => {
-            Ok("                                   List of roles\n Role name |  Attributes  \n-----------+--------------\n postgres  | Superuser\n".to_string())
+            Ok("                                   List of roles\n Role name |  Attributes  \n-----------+--------------\n icedb     | Superuser\n".to_string())
         }
         MetaCommand::ListDatabases => {
             let registry = sql::db_manager::DatabaseRegistry::new(data_dir);
@@ -125,7 +130,7 @@ pub fn execute_meta_command(
 }
 
 const HELP_TEXT: &str = r#"General
-  \q             quit nkv-psql
+  \q             quit isql
   \?             show this help
 
 Informational
@@ -138,5 +143,8 @@ Informational
 Formatting
   \timing        toggle timing of commands
   \x             toggle expanded output
+
+Buffer
+  \r             reset (clear) the query buffer
 
 "#;

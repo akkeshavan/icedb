@@ -120,7 +120,7 @@ impl StartupHandler for IceDbStartupHandler {
             PgWireFrontendMessage::PasswordMessageFamily(pwd) => {
                 let pwd = pwd.into_password()?;
                 let login_info = LoginInfo::from_client_info(client);
-                let username = login_info.user().unwrap_or("postgres");
+                let username = login_info.user().unwrap_or("icedb");
                 let password = std::str::from_utf8(pwd.password.as_bytes()).unwrap_or("");
 
                 match self.authenticator.authenticate(username, password) {

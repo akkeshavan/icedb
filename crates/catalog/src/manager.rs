@@ -124,6 +124,9 @@ impl CatalogManager {
         // Load ACLs from disk
         let table_acls = Self::load_acls_from_disk(data_dir)?;
 
+        // Load FK registry from disk
+        let fk_registry = Self::load_fk_registry_from_disk(data_dir);
+
         let mgr = CatalogManager {
             data_dir: data_dir.to_path_buf(),
             wal_writer,
@@ -136,7 +139,7 @@ impl CatalogManager {
             index_registry: RwLock::new(HashMap::new()),
             unique_constraints: RwLock::new(HashMap::new()),
             sequences: Mutex::new(sequences),
-            fk_registry: RwLock::new(HashMap::new()),
+            fk_registry: RwLock::new(fk_registry),
             check_registry: RwLock::new(HashMap::new()),
             table_acls: Mutex::new(table_acls),
             notify_subscribers: Mutex::new(HashMap::new()),
@@ -319,7 +322,7 @@ impl CatalogManager {
         // Insert superuser role
         let superuser = PgAuthidRow {
             oid: OID_ROLE_SUPERUSER,
-            rolname: "postgres".to_string(),
+            rolname: "icedb".to_string(),
             rolsuper: true,
             rolinherit: true,
             rolcreaterole: true,
@@ -419,12 +422,16 @@ impl CatalogManager {
                 }
             }
 
+            let foreign_keys = {
+                let reg = self.fk_registry.read();
+                reg.get(&class_row.oid).cloned().unwrap_or_default()
+            };
             let schema = TableSchema {
                 oid: class_row.oid,
                 name: class_row.relname.clone(),
                 namespace_oid: class_row.relnamespace,
                 columns,
-                foreign_keys: Vec::new(),
+                foreign_keys,
                 check_constraints: Vec::new(),
             };
 
@@ -698,6 +705,10 @@ impl CatalogManager {
         {
             let mut name_cache = self.name_cache.write();
             name_cache.remove(&(namespace_oid, table_name.to_string()));
+        }
+        {
+            let mut check_registry = self.check_registry.write();
+            check_registry.remove(&table_oid);
         }
 
         Ok(())
@@ -1219,14 +1230,48 @@ impl CatalogManager {
 
     // ── Foreign key / check constraint registry ───────────────────────────────
 
-    /// Register foreign key constraints for a table.
+    /// Path to the FK registry JSON file.
+    fn fk_registry_path(&self) -> std::path::PathBuf {
+        self.data_dir.join("fk_registry.json")
+    }
+
+    /// Load FK registry from disk into the in-memory registry.
+    fn load_fk_registry_from_disk(
+        data_dir: &std::path::Path,
+    ) -> HashMap<u32, Vec<crate::schema::TableForeignKey>> {
+        let path = data_dir.join("fk_registry.json");
+        if !path.exists() {
+            return HashMap::new();
+        }
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<HashMap<String, Vec<crate::schema::TableForeignKey>>>(&s).ok())
+            .map(|m| m.into_iter().filter_map(|(k, v)| k.parse::<u32>().ok().map(|oid| (oid, v))).collect())
+            .unwrap_or_default()
+    }
+
+    /// Persist the current FK registry to disk.
+    fn persist_fk_registry(&self) {
+        let reg = self.fk_registry.read();
+        // Serialize with string keys so JSON is valid (JSON keys must be strings).
+        let map: HashMap<String, &Vec<crate::schema::TableForeignKey>> =
+            reg.iter().map(|(k, v)| (k.to_string(), v)).collect();
+        if let Ok(json) = serde_json::to_string_pretty(&map) {
+            let _ = std::fs::write(self.fk_registry_path(), json);
+        }
+    }
+
+    /// Register foreign key constraints for a table and persist to disk.
     pub fn set_foreign_keys(
         &self,
         table_oid: u32,
         fks: Vec<crate::schema::TableForeignKey>,
     ) {
-        let mut reg = self.fk_registry.write();
-        reg.insert(table_oid, fks);
+        {
+            let mut reg = self.fk_registry.write();
+            reg.insert(table_oid, fks);
+        }
+        self.persist_fk_registry();
     }
 
     /// Get foreign key constraints for a table.

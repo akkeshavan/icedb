@@ -133,7 +133,7 @@ These features cannot be added with planner or executor changes alone — they r
 
 ### PostgreSQL wire protocol (network layer)
 
-**What is missing:** Accepting TCP connections from `psql`, DBeaver, pgAdmin, JDBC, `psycopg2`, and any other PostgreSQL client. Currently the engine runs only in embedded mode (in-process via the Rust API or the `nkv-psql` CLI which calls the engine directly).
+**What is missing:** Accepting TCP connections from `psql`, DBeaver, pgAdmin, JDBC, `psycopg2`, and any other PostgreSQL client. Currently the engine runs only in embedded mode (in-process via the Rust API or the `isql` CLI which calls the engine directly).
 
 **What is needed:**
 1. **`pgwire` crate integration** — the `crates/network` stub exists but is not wired. `pgwire` handles framing, message parsing, and the `BackendMessage`/`FrontendMessage` codec.

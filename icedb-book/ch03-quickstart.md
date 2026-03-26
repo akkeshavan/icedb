@@ -42,7 +42,7 @@ Open a second terminal and start the CLI:
 cargo run -p cli --release -- --data-dir ./data
 ```
 
-The CLI (nkv-psql) runs the storage engine in-process against the data directory — no separate server process or TCP connection is needed. You will see:
+The CLI (isql) runs the storage engine in-process against the data directory — no separate server process or TCP connection is needed. You will see:
 
 ```
 icedb=#
@@ -419,8 +419,8 @@ Add a `genre` column to make this concrete. First, create a genres reference tab
 
 ```sql
 CREATE TABLE genres (
-    id   INT NOT NULL,
-    name TEXT NOT NULL
+    genre_id INT NOT NULL,
+    name     TEXT NOT NULL
 );
 
 CREATE TABLE book_genres (
@@ -566,15 +566,15 @@ INSERT INTO orders VALUES (6, 2, 3, 74.97) RETURNING id, total_price;
 `RETURNING` also works with `UPDATE` and `DELETE`. After updating prices, see the new values immediately:
 
 ```sql
-UPDATE books SET price = price * 0.90
+UPDATE books SET price = ROUND(price * 0.90, 2)
 WHERE author_id = 4
 RETURNING title, price;
 ```
 
 ```
      title      | price
-----------------+--------
- Blood Meridian | 13.491
+----------------+-------
+ Blood Meridian | 13.49
 ```
 
 And after a delete, confirm which rows were removed:
@@ -605,9 +605,9 @@ ORDER BY kind, label;
 ```
             label            |  kind
 -----------------------------+--------
- Anonymous                   | author
  Cormac McCarthy             | author
  Frank Herbert               | author
+ Gene Wolfe                  | author
  J.R.R. Tolkien              | author
  Ursula K. Le Guin           | author
  Blood Meridian              | book
@@ -649,8 +649,8 @@ ORDER BY total_revenue DESC;
 ```
       name      | total_revenue
 ----------------+---------------
+ J.R.R. Tolkien |        125.94
  Frank Herbert  |         95.94
- Ursula K. Le Guin |      41.97
 ```
 
 Each CTE block (`book_revenue`, `author_revenue`) is evaluated once and can be referenced multiple times in the main query. They make queries with multiple aggregation steps far easier to read and maintain than equivalent nested subqueries.
@@ -664,7 +664,7 @@ SELECT a.name, COUNT(*) AS book_count
 FROM books b
 JOIN authors a ON b.author_id = a.id
 GROUP BY a.name
-ORDER BY book_count DESC;
+ORDER BY book_count DESC, a.name;
 ```
 
 ```
@@ -675,6 +675,8 @@ ORDER BY book_count DESC;
  Ursula K. Le Guin   |          2
  Cormac McCarthy     |          1
 ```
+
+The secondary sort `a.name` is added to break ties deterministically. When multiple rows share the same `book_count`, SQL does not guarantee which order they appear in — the database is free to return them in any order. Without the secondary sort you may see `J.R.R. Tolkien` before `Frank Herbert` on one run and the opposite on another. Adding `, a.name` after the primary sort column ensures the output is always alphabetical within each count group.
 
 Average, minimum, maximum, and sum of prices:
 
@@ -688,9 +690,9 @@ FROM books;
 ```
 
 ```
-    avg_price     | min_price | max_price | total_catalog_value
-------------------+-----------+-----------+---------------------
- 15.6957142857143 |     11.99 |     24.99 |              109.87
+      avg_price      | min_price | max_price | total_catalog_value
+---------------------+-----------+-----------+---------------------
+ 15.347142857142854  |     11.99 |     24.99 | 107.42999999999998
 ```
 
 Revenue per book (summing order quantities):
@@ -706,9 +708,9 @@ ORDER BY revenue DESC;
 ```
           title            | units_sold | revenue
 ---------------------------+------------+---------
+ The Lord of the Rings     |          4 |   99.96
  Dune                      |          6 |   95.94
  The Left Hand of Darkness |          3 |   41.97
- The Lord of the Rings     |          1 |   24.99
  The Hobbit                |          2 |   25.98
 ```
 
@@ -717,7 +719,7 @@ ORDER BY revenue DESC;
 Apply a 10% price increase to all Herbert books:
 
 ```sql
-UPDATE books SET price = price * 1.10 WHERE author_id = 2;
+UPDATE books SET price = ROUND(price * 1.10, 2) WHERE author_id = 2;
 ```
 
 ```
@@ -733,8 +735,8 @@ SELECT title, price FROM books WHERE author_id = 2;
 ```
       title       | price
 ------------------+-------
- Dune             | 17.589
- Children of Dune | 15.389
+ Dune             | 17.59
+ Children of Dune | 15.39
 ```
 
 Correct a typo in an author's name:
@@ -792,20 +794,40 @@ ORDER BY price;
 ---------------------------+-------+-----------
  The Dispossessed          | 11.99 | budget
  The Hobbit                | 12.99 | budget
+ Blood Meridian            | 13.49 | mid-range
  The Left Hand of Darkness | 13.99 | mid-range
- Children of Dune          | 13.99 | mid-range
- Blood Meridian            | 14.99 | mid-range
- Dune                      | 15.99 | mid-range
+ Children of Dune          | 15.39 | mid-range
+ Dune                      | 17.59 | mid-range
  The Lord of the Rings     | 24.99 | premium
 ```
 
-Use `COALESCE` to provide a fallback value for a nullable column:
+Use `COALESCE` to provide a fallback value for a nullable column. First add an author whose country is not yet known:
+
+```sql
+INSERT INTO authors VALUES (6, 'Anonymous', NULL);
+```
+
+Now query with `COALESCE` — any row where `country` is NULL will display `'Unknown'` instead of blank:
 
 ```sql
 SELECT name, COALESCE(country, 'Unknown') AS country FROM authors ORDER BY name;
 ```
 
-Any author with a NULL `country` will show `'Unknown'` instead of blank.
+```
+      name         |    country
+-------------------+----------------
+ Anonymous         | Unknown
+ Cormac McCarthy   | United States
+ Frank Herbert     | United States
+ J.R.R. Tolkien    | United Kingdom
+ Ursula K. Le Guin | United States
+```
+
+Remove the placeholder row when you are done:
+
+```sql
+DELETE FROM authors WHERE id = 6;
+```
 
 ### String Functions
 
@@ -845,6 +867,8 @@ WHERE POSITION(' ' IN title) > 0;
  The Hobbit                | The
  The Lord of the Rings     | The
  The Left Hand of Darkness | The
+ The Dispossessed          | The
+ Blood Meridian            | Blood
  Children of Dune          | Children
 ```
 
@@ -889,7 +913,6 @@ SELECT id, name, bio FROM authors ORDER BY id;
   2 | Frank Herbert       | NULL
   3 | Ursula K. Le Guin   | NULL
   4 | Cormac McCarthy     | NULL
-  5 | Gene Wolfe          | NULL
 ```
 
 You can also rename or drop a column, or rename the whole table:
@@ -951,9 +974,9 @@ ORDER BY a.name, price_rank;
 ```
         author       |          title            | price | price_rank
 ---------------------+---------------------------+-------+------------
- Cormac McCarthy     | Blood Meridian            | 14.99 |          1
- Frank Herbert       | Dune                      | 15.99 |          1
- Frank Herbert       | Children of Dune          | 13.99 |          2
+ Cormac McCarthy     | Blood Meridian            | 13.49 |          1
+ Frank Herbert       | Dune                      | 17.59 |          1
+ Frank Herbert       | Children of Dune          | 15.39 |          2
  J.R.R. Tolkien      | The Lord of the Rings     | 24.99 |          1
  J.R.R. Tolkien      | The Hobbit                | 12.99 |          2
  Ursula K. Le Guin   | The Left Hand of Darkness | 13.99 |          1
@@ -1153,6 +1176,20 @@ SELECT * FROM settings;
 
 A savepoint marks a named point inside an open transaction. If a later step fails or you change your mind, you can roll back to the savepoint without discarding everything the transaction did before it.
 
+First, set up a simple accounts table:
+
+```sql
+CREATE TABLE accounts (
+    id      SERIAL PRIMARY KEY,
+    name    TEXT NOT NULL,
+    balance NUMERIC(12,2) NOT NULL DEFAULT 0
+);
+INSERT INTO accounts (name, balance) VALUES ('Alice', 1000.00);
+INSERT INTO accounts (name, balance) VALUES ('Bob',    500.00);
+```
+
+Now run a multi-step transaction with a savepoint:
+
 ```sql
 BEGIN;
 
@@ -1160,27 +1197,71 @@ BEGIN;
 UPDATE accounts SET balance = balance - 100 WHERE name = 'Alice';
 SAVEPOINT after_debit;
 
--- Step 2: credit Bob's account (imagine this fails due to a constraint)
+-- Step 2: credit Bob (imagine a logic error was detected here)
 UPDATE accounts SET balance = balance + 100 WHERE name = 'Bob';
 
--- Oops — something was wrong. Roll back only step 2:
+-- Roll back only step 2; Alice's debit is preserved:
 ROLLBACK TO SAVEPOINT after_debit;
 
--- Retry step 2 with corrected values, then commit:
+-- Retry step 2 with the corrected amount, then commit:
 UPDATE accounts SET balance = balance + 100 WHERE name = 'Bob';
 COMMIT;
 ```
 
-`RELEASE SAVEPOINT name` discards the savepoint (freeing the name) without rolling back:
+Verify the final state:
 
 ```sql
-SAVEPOINT sp1;
--- ... do work ...
-RELEASE SAVEPOINT sp1;   -- savepoint consumed; no rollback
+SELECT name, balance FROM accounts ORDER BY name;
+```
+
+```
+ name  | balance
+-------+---------
+ Alice |  900.00
+ Bob   |  600.00
+(2 rows)
+```
+
+Alice's balance is 900 (debit preserved), Bob's is 600 (credit applied once). The failed intermediate credit to Bob was fully undone without touching Alice's row.
+
+`RELEASE SAVEPOINT name` discards the savepoint without rolling back — useful when you know a code path succeeded and want to reclaim the savepoint name:
+
+```sql
+BEGIN;
+INSERT INTO accounts (name, balance) VALUES ('Carol', 250.00);
+SAVEPOINT after_carol;
+-- ... more work ...
+RELEASE SAVEPOINT after_carol;   -- savepoint consumed; transaction continues
 COMMIT;
 ```
 
-> **Note:** In the current version of icedb, `ROLLBACK TO SAVEPOINT` aborts the entire transaction and starts a new one — pre-savepoint changes are not preserved. Full partial-rollback (true page-level undo) is planned for a future release. SAVEPOINT and RELEASE are accepted and tracked, and the commands are safe to use.
+Savepoints can be nested:
+
+```sql
+BEGIN;
+INSERT INTO accounts (name, balance) VALUES ('Dave', 100.00);
+SAVEPOINT sp1;
+
+INSERT INTO accounts (name, balance) VALUES ('Eve', 200.00);
+SAVEPOINT sp2;
+
+INSERT INTO accounts (name, balance) VALUES ('Frank', 300.00);
+
+-- Undo Frank only:
+ROLLBACK TO SAVEPOINT sp2;
+
+-- sp1 is still valid — undo Eve too:
+ROLLBACK TO SAVEPOINT sp1;
+
+-- Only Dave remains; commit:
+COMMIT;
+
+SELECT name FROM accounts WHERE name IN ('Dave', 'Eve', 'Frank');
+--  name
+-- ------
+--  Dave
+-- (1 row)
+```
 
 ### Granting Table Access to a Role
 
@@ -1197,7 +1278,15 @@ GRANT SELECT ON authors TO reporter;
 -- The reporter role can now query these tables but not insert or update
 ```
 
-Connect as `reporter` and verify access works:
+Connect as `reporter` by opening a new CLI session with the `-U` flag:
+
+```bash
+isql --data-dir ./data -U reporter
+```
+
+> **Note:** The password (`report-pass`) is enforced by the network/wire protocol when connecting over TCP. The CLI opens the data directory directly and uses the role name to enforce privilege checks; the password is not prompted.
+
+Once connected as `reporter`, verify that SELECT works:
 
 ```sql
 SELECT title FROM books LIMIT 3;

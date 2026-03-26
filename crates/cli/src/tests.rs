@@ -17,7 +17,7 @@ use sql::value::Value;
 #[test]
 fn test_config_defaults() {
     // Use args with only the program name
-    let args: Vec<String> = vec!["nkv-psql".to_string()];
+    let args: Vec<String> = vec!["isql".to_string()];
     // Temporarily remove env vars that might interfere
     let _pg_user = std::env::var("PGUSER").ok();
     let _pg_db = std::env::var("PGDATABASE").ok();
@@ -29,7 +29,7 @@ fn test_config_defaults() {
 #[test]
 fn test_config_from_args() {
     let args: Vec<String> = vec![
-        "nkv-psql".to_string(),
+        "isql".to_string(),
         "--data-dir".to_string(),
         "/tmp/mydb".to_string(),
         "--user".to_string(),
@@ -72,7 +72,7 @@ fn test_format_table_with_rows() {
 #[test]
 #[allow(clippy::approx_constant)]
 fn test_format_value() {
-    assert_eq!(format_value(&Value::Null), "");
+    assert_eq!(format_value(&Value::Null), "NULL");
     assert_eq!(format_value(&Value::Bool(true)), "t");
     assert_eq!(format_value(&Value::Bool(false)), "f");
     assert_eq!(format_value(&Value::Int4(42)), "42");

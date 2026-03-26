@@ -1,6 +1,6 @@
-# Chapter 8: CLI Reference (nkv-psql)
+# Chapter 8: CLI Reference (isql)
 
-The `nkv-psql` CLI is icedb's interactive terminal. It provides a `rustyline`-based REPL with persistent history, tab completion, meta-commands for inspecting the database, and result rendering as ASCII tables. The CLI (nkv-psql) runs the storage engine in-process against the data directory — no separate server process or TCP connection is needed.
+The `isql` CLI is icedb's interactive terminal. It provides a `rustyline`-based REPL with persistent history, tab completion, meta-commands for inspecting the database, and result rendering as ASCII tables. The CLI (isql) runs the storage engine in-process against the data directory — no separate server process or TCP connection is needed.
 
 **In this chapter:**
 - Starting the CLI and command-line flags
@@ -22,7 +22,7 @@ cargo run -p cli -- --data-dir ./mydata
 cargo run -p cli --release -- --data-dir ./mydata
 
 # If you have installed the binary
-nkv-psql --data-dir /var/lib/icedb/data
+isql --data-dir /var/lib/icedb/data
 ```
 
 The `--data-dir` flag specifies the data directory (default: `./data`). If the directory does not exist, the CLI creates it and bootstraps a fresh database.
@@ -180,8 +180,8 @@ Meta-commands begin with a backslash (`\`). They are processed locally by the CL
 
 | Command | Description |
 |---------|-------------|
-| `\q` | Quit nkv-psql |
-| `\quit` | Quit nkv-psql (alias for `\q`) |
+| `\q` | Quit isql |
+| `\quit` | Quit isql (alias for `\q`) |
 | `\d` | List all tables in the `public` schema |
 | `\dt` | List all tables in the `public` schema (same as `\d`) |
 | `\d tablename` | Describe the columns of `tablename` |
@@ -321,7 +321,7 @@ Reads and executes each SQL statement in the file sequentially. Errors in indivi
 ```
 icedb=# \?
 General
-  \q             quit nkv-psql
+  \q             quit isql
   \?             show this help
 
 Connection

@@ -37,5 +37,5 @@ fn parse_arg(args: &[String], flag: &str) -> Option<String> {
 fn dirs_or_home_history_path() -> Option<String> {
     std::env::var("HOME")
         .ok()
-        .map(|home| format!("{}/.nkv_psql_history", home))
+        .map(|home| format!("{}/.isql_history", home))
 }

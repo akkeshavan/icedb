@@ -1,6 +1,6 @@
 # IceDB Implementation Status
 
-**Last updated**: 2026-03-22
+**Last updated**: 2026-03-22 (session 2)
 **Total tests**: 968 passing, 4 ignored, 0 failing
 **Build**: `cargo build --workspace` — clean, zero warnings
 
@@ -158,7 +158,7 @@ All storage primitives implemented and tested.
 | Unit tests (7 in `server` crate) | ✅ |
 | `psql` real-connection smoke test | ⚠️ implemented but not automated |
 
-### Phase 8 — CLI (nkv-psql) ✅ COMPLETE
+### Phase 8 — CLI (isql) ✅ COMPLETE
 
 | Item | Status |
 |------|--------|
@@ -296,6 +296,55 @@ These were explicitly excluded because the feature doesn't exist in icedb yet:
 
 ---
 
+## Bug fixes applied (session 2 — 2026-03-22)
+
+These bugs were discovered and fixed during chapter-by-chapter end-to-end testing of the CLI.
+
+### 1. Data invisible after process restart (XID persistence bug)
+
+**Root cause**: `NEXT_XID` (global atomic in `txn/src/xid.rs`) resets to 3 on every process start. Old committed rows have `t_xmin` values like 10+. The first new snapshot has `xmax = 4`, so `xid_is_visible(10)` returns `false` (treats old XIDs as "future"). All rows are invisible after restart.
+
+**Fix**: Added `advance_next_xid(min_val)` in `crates/txn/src/xid.rs`. Called from `TransactionManager::new_with_wal_recovery()` after scanning WAL Commit records — advances the global allocator to `max_committed_xid + 1`. Also changed `crates/cli/src/main.rs` to use `new_with_wal_recovery()` instead of `new()` for the default icedb engine.
+
+**Files changed**: `crates/txn/src/xid.rs`, `crates/txn/src/manager.rs`, `crates/cli/src/main.rs`
+
+### 2. `--dbname` flag only changed prompt, not engine
+
+**Root cause**: `Repl::new()` stored `config.dbname` in `current_db` (used for prompt) but `engine` and `catalog` still pointed at the default icedb database. Queries ran against icedb regardless of `--dbname`.
+
+**Fix**: `Repl::new()` now calls `db_manager.get_or_open(&current_db)` when `current_db != "icedb"` and updates `self.engine` and `self.catalog` before the REPL loop starts.
+
+**File changed**: `crates/cli/src/repl.rs`
+
+### 3. BEGIN/COMMIT/ROLLBACK were no-ops in CLI
+
+**Root cause**: `execute_sql()` called `engine.execute()`, which auto-commits every statement. `BEGIN` opened a transaction that was immediately committed; `ROLLBACK` had no open session to roll back.
+
+**Fix**: Changed `execute_sql()` to call `engine.execute_session("repl", sql)`, which maintains open transaction state in `open_sessions: Mutex<HashMap<String, Xid>>` across successive REPL calls.
+
+**File changed**: `crates/cli/src/repl.rs`
+
+### 4. SQL comment lines (`--`) broke transaction routing
+
+**Root cause**: A `--` comment line without `;` was accumulated into the SQL buffer. The next line (e.g., `BEGIN`) was appended producing `"-- remark\nBEGIN"`. This combined string did not match the `sql_upper == "BEGIN"` check in `execute_session_single`, so BEGIN was routed as a plain query instead of starting a transaction.
+
+**Fix**: REPL loop now skips lines starting with `--` entirely (same behaviour as psql).
+
+**File changed**: `crates/cli/src/repl.rs`
+
+---
+
+## Known CLI limitations (discovered during chapter testing)
+
+| Limitation | Workaround |
+|------------|-----------|
+| `\du` is a hardcoded stub — always shows only `postgres` | Query `pg_roles` directly: `SELECT rolname FROM pg_roles;` |
+| `\x` (expanded output) flag is accepted but output format is unchanged | Use regular table output; no workaround |
+| `JOIN USING (col)` returns 0 rows | Rewrite as `JOIN t ON a.col = t.col` |
+| `CREATE INDEX` on an existing table does not backfill old rows into the index; index scan returns fewer results until process restart (at which point SeqScan is chosen) | Restart the process after creating the index, or rely on SeqScan |
+
+---
+
 ## Key architectural decisions made
 
 - **Multi-database support**: `DatabaseManager` (in `sql/src/db_manager.rs`) lazily creates/caches `Arc<QueryEngine>` per database. `DatabaseRegistry` persists database names in `{data_dir}/pg_database.json`. The default `icedb` database uses `data_dir/` directly for backward compatibility; all other databases live at `data_dir/databases/{name}/`. Network routing uses `client.metadata().get("database")` in `do_query`.
@@ -311,15 +360,19 @@ These were explicitly excluded because the feature doesn't exist in icedb yet:
 These are the gaps most likely to matter for a "production-ready" claim, roughly in priority order:
 
 1. **ON CONFLICT (UPSERT)** — blocked 2 integration tests; needed for practical use
-2. **ALTER TABLE** — basic operations (ADD/DROP/RENAME COLUMN, RENAME TABLE) implemented; advanced ops (type changes, constraint modifications) remain absent
-3. **OOM-safe buffer pool** — current implementation can grow without bound under load
-4. **Connection limit + graceful SIGTERM shutdown** — needed for production deployment
-5. **ANALYZE** — without it, `pg_statistic` histograms are never updated; cost-based optimizer degrades over time
-6. **Fault-injection tests** — bank-transfer SIGKILL and power-off recovery are untested automatically
-7. **Cross-language drivers** — Python and Node.js stubs need actual implementation
-8. **NATURAL JOIN** — simple to add; unblocks 1 ignored test
-9. **Full window functions** (PARTITION BY, frame specs) — currently basic OVER/ORDER BY only
-10. **pgbench / DBeaver compatibility** — validates real-world PostgreSQL client compatibility
+2. **`JOIN USING`** — returns 0 rows; users must rewrite as `JOIN t ON a.col = t.col`
+3. **`\du` meta-command** — hardcoded stub; should query `pg_authid`/`pg_roles` like `\dt` does
+4. **`CREATE INDEX` backfill** — new index does not include pre-existing rows; index scan silently returns fewer results until process restart
+5. **`\x` expanded output** — flag accepted but output format is unchanged; needs formatter
+6. **ALTER TABLE** — basic operations (ADD/DROP/RENAME COLUMN, RENAME TABLE) implemented; advanced ops (type changes, constraint modifications) remain absent
+7. **OOM-safe buffer pool** — current implementation can grow without bound under load
+8. **Connection limit + graceful SIGTERM shutdown** — needed for production deployment
+9. **ANALYZE** — without it, `pg_statistic` histograms are never updated; cost-based optimizer degrades over time
+10. **Fault-injection tests** — bank-transfer SIGKILL and power-off recovery are untested automatically
+11. **Cross-language drivers** — Python and Node.js stubs need actual implementation
+12. **NATURAL JOIN** — simple to add; unblocks 1 ignored test
+13. **Full window functions** (PARTITION BY, frame specs) — currently basic OVER/ORDER BY only
+14. **pgbench / DBeaver compatibility** — validates real-world PostgreSQL client compatibility
 
 ---
 

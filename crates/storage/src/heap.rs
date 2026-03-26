@@ -50,9 +50,11 @@ impl HeapFile {
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.read_exact(&mut buf)?;
         let page = Page::from_bytes(buf);
-        // Verify checksum only if the stored checksum is non-zero (0 means
-        // the page predates checksumming or has never been written with one).
-        if page.checksum() != 0 && !page.verify_checksum() {
+        // Always verify the checksum.  write_page() always stamps it, so a
+        // mismatch (including a corrupted-to-zero checksum) is a real error.
+        // Freshly-zeroed pages that have never been written will fail here —
+        // that is intentional: callers must write before reading.
+        if !page.verify_checksum() {
             return Err(HeapError::Page(crate::error::PageError::ChecksumMismatch));
         }
         Ok(page)
@@ -60,12 +62,15 @@ impl HeapFile {
 
     /// Write `page` to position `page_no` on disk.
     ///
-    /// Does NOT flush — callers that need durability should call [`flush`].
+    /// Always stamps the FNV-1a checksum into the page header before writing so
+    /// that every on-disk page can be validated on read.  Does NOT flush —
+    /// callers that need durability should call [`flush`].
     pub fn write_page(&mut self, page_no: u32, page: &Page) -> Result<(), HeapError> {
+        let mut page_with_checksum = page.clone();
+        page_with_checksum.update_checksum();
         let offset = page_no as u64 * PAGE_SIZE as u64;
         self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(page.as_bytes())?;
-        // Note: no flush here — callers manage durability
+        self.file.write_all(page_with_checksum.as_bytes())?;
         Ok(())
     }
 
@@ -78,7 +83,9 @@ impl HeapFile {
     /// Extend the file with one new zeroed page and return its page number.
     pub fn allocate_page(&mut self) -> Result<u32, HeapError> {
         let page_no = self.num_pages();
-        let page = Page::new();
+        let mut page = Page::new();
+        // Stamp the checksum so read_page can verify it immediately.
+        page.update_checksum();
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(page.as_bytes())?;
         self.file.flush()?;

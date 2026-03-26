@@ -52,7 +52,7 @@ impl Repl {
             let _ = rl.load_history(history_file);
         }
 
-        println!("nkv-psql (icedb {})", env!("CARGO_PKG_VERSION"));
+        println!("isql (icedb {})", env!("CARGO_PKG_VERSION"));
         println!("Type \"help\" for help, \"\\q\" to quit.\n");
 
         let mut timing = false;
@@ -103,6 +103,12 @@ impl Repl {
                 let _ = rl.add_history_entry(trimmed);
                 match parse_meta_command(trimmed) {
                     Ok(cmd) => {
+                        // Warn when there is pending SQL in the buffer so the
+                        // user knows their statement hasn't executed yet.
+                        if !sql_buffer.is_empty() && !matches!(cmd, crate::meta::MetaCommand::ResetBuffer) {
+                            eprintln!("WARNING: query buffer is not empty (forgot a semicolon?).");
+                            eprintln!("         Use \\r to discard the pending input.");
+                        }
                         match execute_meta_command(
                             cmd,
                             &self.catalog,
@@ -114,6 +120,12 @@ impl Repl {
                             Ok(output) => {
                                 if output == "\\q" {
                                     break;
+                                }
+                                // Handle \r — reset query buffer
+                                if output == "\\r" {
+                                    sql_buffer.clear();
+                                    println!("Query buffer reset.");
+                                    continue;
                                 }
                                 // Handle \c dbname — switch database
                                 if let Some(db_name) = output.strip_prefix("\\c ") {
@@ -219,9 +231,21 @@ fn split_statements(sql: &str) -> Vec<String> {
     let mut stmts = Vec::new();
     let mut current = String::new();
     let mut in_quote = false;
+    let mut chars = sql.chars().peekable();
 
-    for ch in sql.chars() {
+    while let Some(ch) = chars.next() {
         match ch {
+            // Line comment: skip from '--' to end of line.
+            // Must be checked before the general '-' arm and only outside quotes,
+            // so that apostrophes inside comments don't corrupt quote tracking.
+            '-' if !in_quote && chars.peek() == Some(&'-') => {
+                chars.next(); // consume the second '-'
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
             '\'' => {
                 in_quote = !in_quote;
                 current.push(ch);

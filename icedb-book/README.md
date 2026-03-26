@@ -17,7 +17,7 @@ This book is the complete reference for anyone using, operating, or building on 
 | [Chapter 5](ch05-transactions-and-acid.md) | Transactions & ACID Guarantees | How atomicity, consistency, isolation, and durability work; MVCC explained; isolation levels with anomaly examples; WAL and crash recovery |
 | [Chapter 6](ch06-indexes.md) | Indexes & Query Performance | The B+ tree index, creating and using indexes, range scans, the query planner, when not to index |
 | [Chapter 7](ch07-security.md) | Authentication & Security | SCRAM-SHA-256, password storage format, role-based access control, privilege flags |
-| [Chapter 8](ch08-cli-reference.md) | CLI Reference (nkv-psql) | All flags, environment variables, meta-commands, tab completion, output formatting |
+| [Chapter 8](ch08-cli-reference.md) | CLI Reference (isql) | All flags, environment variables, meta-commands, tab completion, output formatting |
 | [Chapter 9](ch09-drivers.md) | Client Drivers | Rust, Python, and Node.js embedded drivers — connection, queries, transactions, type mapping |
 | [Chapter 10](ch10-architecture.md) | Architecture Deep Dive | Every layer from wire protocol to disk; page layout diagrams; MVCC timeline; WAL write-ahead rule; recovery procedure |
 | [Chapter 11](ch11-operations.md) | Running in Production | Data directory layout, systemd unit, backup, monitoring, shutdown, known limitations |

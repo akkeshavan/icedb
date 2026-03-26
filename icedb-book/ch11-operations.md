@@ -239,9 +239,9 @@ Unlike PostgreSQL's autovacuum, icedb's current implementation uses a time-based
 
 icedb provides two complementary backup mechanisms: a **logical dump** via the CLI for portability, and a **cold (filesystem) backup** for full fidelity including indexes and WAL.
 
-### Logical Dump and Restore (nkv-psql)
+### Logical Dump and Restore (isql)
 
-The `nkv-psql` CLI provides built-in dump and restore commands that work without stopping the server:
+The `isql` CLI provides built-in dump and restore commands that work without stopping the server:
 
 ```
 \dump /path/to/backup.sql
@@ -269,13 +269,13 @@ This executes all SQL statements in the file against the current database.
 
 ```
 # Connect to source database
-nkv-psql --data-dir /var/data/icedb_prod
+isql --data-dir /var/data/icedb_prod
 
 icedb=# \dump /backups/icedb_2026_03_19.sql
 Dumped 1247 statements to /backups/icedb_2026_03_19.sql
 
 # Connect to new database
-nkv-psql --data-dir /var/data/icedb_new
+isql --data-dir /var/data/icedb_new
 
 icedb=# \restore /backups/icedb_2026_03_19.sql
 Restored 1247 statements from /backups/icedb_2026_03_19.sql

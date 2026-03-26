@@ -244,7 +244,7 @@ When a client connects via TCP (using `psql` or any PostgreSQL driver), the star
 
 ### The CLI Does Not Require Authentication
 
-The `nkv-psql` CLI (`cargo run -p cli -- --data-dir ./data`) opens the database engine directly in-process. No network connection is established and no password is required. The CLI runs with full superuser access. This is intentional for local administration — it mirrors PostgreSQL's `peer` authentication for local Unix socket connections.
+The `isql` CLI (`cargo run -p cli -- --data-dir ./data`) opens the database engine directly in-process. No network connection is established and no password is required. The CLI runs with full superuser access. This is intentional for local administration — it mirrors PostgreSQL's `peer` authentication for local Unix socket connections.
 
 ## Creating and Managing Roles in Practice
 

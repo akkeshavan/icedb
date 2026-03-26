@@ -20,49 +20,19 @@ pub const SCRAM_SHA_256: &str = "SCRAM-SHA-256";
 pub const DEFAULT_ITERATIONS: u32 = 4096;
 
 /// Generate a cryptographically random nonce (16 bytes, base64-encoded).
+///
+/// Uses the OS CSPRNG via `getrandom`.  `DefaultHasher` / system-time seeds
+/// are NOT used — they are predictable and trivially brute-forced.
 pub fn generate_nonce() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // Use time + thread id as entropy source (sufficient for a database nonce)
-    let mut hasher = DefaultHasher::new();
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
-        .hash(&mut hasher);
-    std::thread::current().id().hash(&mut hasher);
-    let h1 = hasher.finish();
-    std::process::id().hash(&mut hasher);
-    let h2 = hasher.finish();
-
     let mut bytes = [0u8; 16];
-    bytes[0..8].copy_from_slice(&h1.to_le_bytes());
-    bytes[8..16].copy_from_slice(&h2.to_le_bytes());
+    getrandom::getrandom(&mut bytes).expect("OS CSPRNG unavailable");
     BASE64.encode(bytes)
 }
 
-/// Generate a random 16-byte salt.
+/// Generate a cryptographically random 16-byte salt.
 pub fn generate_salt() -> Vec<u8> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let mut hasher = DefaultHasher::new();
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
-        .hash(&mut hasher);
-    let h = hasher.finish();
-
-    // Mix more entropy
-    let pid = std::process::id() as u64;
-
     let mut salt = [0u8; 16];
-    salt[0..8].copy_from_slice(&h.to_le_bytes());
-    salt[8..16].copy_from_slice(&pid.wrapping_mul(0x9E3779B97F4A7C15).to_le_bytes());
+    getrandom::getrandom(&mut salt).expect("OS CSPRNG unavailable");
     salt.to_vec()
 }
 

@@ -208,7 +208,7 @@ The authentication process involves a multi-step exchange:
 
 ## **Command-Line Interface (CLI) and Administration**
 
-The database includes a powerful CLI, designated as nkv-psql, which allows administrators and users to interact with the database directly from the terminal.42 The CLI is built using the rustyline crate for line editing and history, providing an experience consistent with the standard psql tool.44
+The database includes a powerful CLI, designated as isql, which allows administrators and users to interact with the database directly from the terminal.42 The CLI is built using the rustyline crate for line editing and history, providing an experience consistent with the standard psql tool.44
 
 ## **CLI Architecture and Functionality**
 
