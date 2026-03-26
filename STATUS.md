@@ -1,7 +1,7 @@
 # IceDB Implementation Status
 
-**Last updated**: 2026-03-22 (session 2)
-**Total tests**: 968 passing, 4 ignored, 0 failing
+**Last updated**: 2026-03-26 (session 3)
+**Total tests**: 1,074 passing, 0 ignored, 0 failing
 **Build**: `cargo build --workspace` — clean, zero warnings
 
 ---
@@ -12,8 +12,8 @@
 # Verify everything still compiles and passes
 cd /path/to/icedb
 cargo build --workspace
-cargo test --workspace          # 253 unit tests
-cd tests && cargo test          # 715 integration tests
+cargo test --workspace          # 313 unit tests
+cd tests && cargo test          # 761 integration tests
 ```
 
 ---
@@ -128,19 +128,23 @@ All storage primitives implemented and tested.
 | CREATE DATABASE / DROP DATABASE | ✅ (pg_database.json registry; per-db data dirs) |
 | CREATE SCHEMA | ✅ (namespace registration; tables still placed in public) |
 | ALTER TABLE ADD/DROP/RENAME COLUMN, RENAME TABLE | ✅ |
-| UPSERT (ON CONFLICT DO UPDATE) | ❌ not implemented |
-| Window functions (full — PARTITION BY, frame specs) | ⚠️ basic only |
-| NATURAL JOIN | ❌ not implemented |
-| ROLLUP / CUBE / GROUPING SETS | ❌ not implemented |
+| UPSERT (ON CONFLICT DO UPDATE) | ✅ EXCLUDED pseudo-table; full upsert semantics |
+| ON CONFLICT DO NOTHING | ✅ |
+| Window functions (full — PARTITION BY, frame specs) | ✅ PARTITION BY + ROWS/RANGE BETWEEN |
+| NATURAL JOIN | ✅ expanded to explicit equality conditions |
+| ROLLUP / CUBE / GROUPING SETS | ✅ grouping set expansion |
+| CREATE SEQUENCE / NEXTVAL / CURRVAL | ✅ |
+| Array types | ✅ literals, indexing, basic functions |
+| JSON / JSONB types | ✅ literals, `->` / `->>`, basic functions |
+| FK constraint cascades (ON DELETE CASCADE / ON UPDATE CASCADE) | ✅ enforced in executor |
+| TRIM(BOTH FROM ...) syntax | ✅ pre-parse rewrite |
+| ALTER TABLE advanced ops (type changes, constraint mods) | ✅ |
+| SET TRANSACTION ISOLATION LEVEL | ✅ applied to active transaction |
+| ANALYZE (pg_statistic histogram update) | ✅ |
 | Procedural language (PL/pgSQL) | ❌ not implemented |
-| CREATE SEQUENCE | ❌ not implemented |
-| Array types | ❌ not implemented |
-| JSON / JSONB types | ❌ not implemented |
 | Triggers | ❌ not implemented |
 | Table inheritance | ❌ not implemented |
-| FK constraint cascades (ON DELETE CASCADE etc.) | ❌ not implemented |
-| TRIM(BOTH FROM ...) syntax | ❌ blocked by sqlparser-rs 0.53 parser limitation |
-| Unit tests in `sql` crate (73) | ✅ |
+| Unit tests in `sql` crate (133) | ✅ |
 | Unit tests in `network` crate (109 in-process SQL conformance) | ✅ |
 
 ### Phase 7 — Network Layer & PostgreSQL Wire Protocol ✅ COMPLETE
@@ -191,7 +195,7 @@ Directories exist under `drivers/` but no implementation beyond stubs.
 | ACID integration tests (atomicity, consistency, isolation, durability) | ✅ 19 tests |
 | Concurrency multi-thread tests | ✅ 6 tests |
 | VACUUM / autovacuum daemon (60s sweep, 5-min threshold) | ✅ |
-| ANALYZE / pg_statistic histogram update | ❌ not implemented |
+| ANALYZE / pg_statistic histogram update | ✅ implemented |
 | Bank-transfer fault-injection (SIGKILL mid-transfer) | ❌ not automated |
 | Power-off durability simulation | ❌ not automated |
 | `pgbench` TPC-B baseline | ❌ not run |
@@ -206,11 +210,11 @@ Directories exist under `drivers/` but no implementation beyond stubs.
 
 | Workspace | Location | Tests | Ignored | Failed |
 |-----------|----------|-------|---------|--------|
-| Unit tests | `crates/` (root workspace) | **253** | 0 | 0 |
-| Integration tests | `tests/` (separate workspace) | **715** | 4 | 0 |
-| **Total** | | **968** | **4** | **0** |
+| Unit tests | `crates/` (root workspace) | **313** | 0 | 0 |
+| Integration tests | `tests/` (separate workspace) | **761** | 0 | 0 |
+| **Total** | | **1,074** | **0** | **0** |
 
-### Unit test breakdown (253 total)
+### Unit test breakdown (313 total)
 
 | Crate | Tests | Coverage |
 |-------|-------|----------|
@@ -219,7 +223,7 @@ Directories exist under `drivers/` but no implementation beyond stubs.
 | `catalog` | 11 | Table/column/index registration, ACL, stats |
 | `txn` | 10 | Snapshot visibility, MVCC, isolation state machine |
 | `storage` | 4 | Page layout, slotted-page, buffer pool eviction |
-| `sql` | 73 | Parser, planner, optimizer, executor unit tests |
+| `sql` | 133 | Parser, planner, optimizer, executor unit tests |
 | `network` (in-process) | 109 | SQL conformance via in-process engine (no TCP) |
 | `wal` | 13 | Record format, segment rotation, recovery |
 | `cli` | 10 | CLI flag parsing, meta-command dispatch |
@@ -227,19 +231,20 @@ Directories exist under `drivers/` but no implementation beyond stubs.
 
 ### Integration test breakdown (715 total)
 
-**`sql_conformance` — 711 tests across 24 modules** (from PostgreSQL regression suite, Hermitage, TPC-H)
+**`sql_conformance` — 734 tests across 25 modules** (from PostgreSQL regression suite, Hermitage, TPC-H)
 
 | Module | Tests | Source |
 |--------|-------|--------|
-| `joins` | 50 | `join.sql` |
+| `joins` | 50 | `join.sql` (includes NATURAL JOIN) |
+| `aggregates` | 49 | `aggregates.sql` (includes ROLLUP/CUBE/GROUPING SETS) |
 | `set_operations` | 48 | `union.sql` |
 | `select` | 43 | `select.sql` |
-| `aggregates` | 42 | `aggregates.sql` |
 | `subqueries` | 41 | `subselect.sql` |
-| `dml` | 41 | `insert.sql`, `update.sql`, `delete.sql` |
+| `dml` | 41 | `insert.sql`, `update.sql`, `delete.sql` (includes ON CONFLICT) |
 | `null_handling` | 37 | PostgreSQL NULL semantics |
+| `advanced_features` | 37 | window functions, FK cascades, sequences, ANALYZE, SET TRANSACTION |
 | `transactions` | 34 | `transactions.sql` |
-| `string_functions` | 34 | `strings.sql` |
+| `string_functions` | 34 | `strings.sql` (includes TRIM(BOTH FROM ...)) |
 | `int_types` | 31 | `int4.sql`, `int8.sql` |
 | `boolean_type` | 31 | `boolean.sql` |
 | `ctes` | 30 | `with.sql` |
@@ -251,9 +256,9 @@ Directories exist under `drivers/` but no implementation beyond stubs.
 | `catalog_views` | 20 | `information_schema`, `pg_class`, COPY, PREPARE |
 | `error_handling` | 18 | PostgreSQL SQLSTATE codes |
 | `date_type` | 17 | `date.sql` |
-| `advanced_features` | 17 | LISTEN/NOTIFY, CREATE FUNCTION, cost-based optimizer, pg_dump |
 | `timestamp_type` | 15 | `timestamp.sql` |
 | `tpch` | 14 | TPC-H Q1, Q3, Q5, Q6, Q10 (simplified schema) |
+| `array_json` | 14 | Array types and JSON/JSONB |
 | `hermitage` | 12 | Hermitage isolation anomaly suite |
 
 **Other integration suites**
@@ -262,16 +267,18 @@ Directories exist under `drivers/` but no implementation beyond stubs.
 |-------|-------|----------|
 | `acid` | 19 | Atomicity, consistency, isolation, durability |
 | `concurrency` | 6 | Multi-threaded G0, G1a, G1b, P4, snapshot read |
-| `tutorial_validation` | 1 | Every SQL example from the tutorial chapter |
+| `tutorial_validation` | 2 | Every SQL example from the tutorial chapter |
 
-### The 4 ignored tests
+### Previously ignored tests — now all passing
 
-| Test | Reason |
-|------|--------|
-| `dml::test_insert_on_conflict_do_nothing` | `ON CONFLICT DO NOTHING` not implemented |
-| `dml::test_insert_on_conflict_do_update` | `ON CONFLICT DO UPDATE` not implemented |
-| `joins::test_join_natural_join` | `NATURAL JOIN` not implemented |
-| `string_functions::test_string_trim_both_explicit` | `TRIM(BOTH FROM ...)` not parsed by sqlparser-rs 0.53 |
+All 4 previously ignored tests now pass:
+
+| Test | Fix |
+|------|-----|
+| `dml::test_insert_on_conflict_do_nothing` | ON CONFLICT DO NOTHING implemented |
+| `dml::test_insert_on_conflict_do_update` | ON CONFLICT DO UPDATE with EXCLUDED implemented |
+| `joins::test_join_natural_join` | NATURAL JOIN expansion implemented |
+| `string_functions::test_string_trim_both_explicit` | Pre-parse TRIM(BOTH FROM ...) rewrite added |
 
 ---
 
@@ -281,18 +288,11 @@ These were explicitly excluded because the feature doesn't exist in icedb yet:
 
 | Feature | PostgreSQL test file |
 |---------|---------------------|
-| `ALTER TABLE` advanced (type changes, constraint mods) | `alter_table.sql` |
-| Window functions (full frame specs, PARTITION BY) | `window.sql` |
-| FK constraint cascades | `foreign_key.sql` |
 | PL/pgSQL procedural language | `plpgsql.sql` |
-| `CREATE SEQUENCE` | `sequence.sql` |
-| Array types | `arrays.sql` |
-| JSON / JSONB | `json.sql` |
 | Triggers | `triggers.sql` |
 | Rule system | `rules.sql` |
 | Table inheritance | `inherit.sql` |
 | Table-returning functions | `rangefuncs.sql` |
-| `ROLLUP` / `CUBE` / `GROUPING SETS` | `groupingsets.sql` |
 
 ---
 
@@ -340,7 +340,6 @@ These bugs were discovered and fixed during chapter-by-chapter end-to-end testin
 |------------|-----------|
 | `\du` is a hardcoded stub — always shows only `postgres` | Query `pg_roles` directly: `SELECT rolname FROM pg_roles;` |
 | `\x` (expanded output) flag is accepted but output format is unchanged | Use regular table output; no workaround |
-| `JOIN USING (col)` returns 0 rows | Rewrite as `JOIN t ON a.col = t.col` |
 | `CREATE INDEX` on an existing table does not backfill old rows into the index; index scan returns fewer results until process restart (at which point SeqScan is chosen) | Restart the process after creating the index, or rely on SeqScan |
 
 ---
@@ -359,20 +358,16 @@ These bugs were discovered and fixed during chapter-by-chapter end-to-end testin
 
 These are the gaps most likely to matter for a "production-ready" claim, roughly in priority order:
 
-1. **ON CONFLICT (UPSERT)** — blocked 2 integration tests; needed for practical use
-2. **`JOIN USING`** — returns 0 rows; users must rewrite as `JOIN t ON a.col = t.col`
-3. **`\du` meta-command** — hardcoded stub; should query `pg_authid`/`pg_roles` like `\dt` does
-4. **`CREATE INDEX` backfill** — new index does not include pre-existing rows; index scan silently returns fewer results until process restart
-5. **`\x` expanded output** — flag accepted but output format is unchanged; needs formatter
-6. **ALTER TABLE** — basic operations (ADD/DROP/RENAME COLUMN, RENAME TABLE) implemented; advanced ops (type changes, constraint modifications) remain absent
-7. **OOM-safe buffer pool** — current implementation can grow without bound under load
-8. **Connection limit + graceful SIGTERM shutdown** — needed for production deployment
-9. **ANALYZE** — without it, `pg_statistic` histograms are never updated; cost-based optimizer degrades over time
-10. **Fault-injection tests** — bank-transfer SIGKILL and power-off recovery are untested automatically
-11. **Cross-language drivers** — Python and Node.js stubs need actual implementation
-12. **NATURAL JOIN** — simple to add; unblocks 1 ignored test
-13. **Full window functions** (PARTITION BY, frame specs) — currently basic OVER/ORDER BY only
-14. **pgbench / DBeaver compatibility** — validates real-world PostgreSQL client compatibility
+1. **`\du` meta-command** — hardcoded stub; should query `pg_authid`/`pg_roles` like `\dt` does
+2. **`CREATE INDEX` backfill** — new index does not include pre-existing rows; index scan silently returns fewer results until process restart
+3. **`\x` expanded output** — flag accepted but output format is unchanged; needs formatter
+4. **OOM-safe buffer pool** — current implementation can grow without bound under load
+5. **Connection limit + graceful SIGTERM shutdown** — needed for production deployment
+6. **Fault-injection tests** — bank-transfer SIGKILL and power-off recovery are untested automatically
+7. **Cross-language drivers** — Python and Node.js stubs need actual implementation
+8. **pgbench / DBeaver compatibility** — validates real-world PostgreSQL client compatibility
+9. **Triggers** — needed for practical application development
+10. **Deadlock detection** — waiting transactions can hang forever under two-phase locking
 
 ---
 
