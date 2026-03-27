@@ -1,0 +1,13 @@
+[workspace]
+
+[package]
+name = "ch03-sandbox"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sql   = { path = "../../crates/sql" }
+txn   = { path = "../../crates/txn" }
+catalog = { path = "../../crates/catalog" }
+wal   = { path = "../../crates/wal" }
+tempfile = "3"
