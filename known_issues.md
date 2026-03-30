@@ -1,6 +1,6 @@
 # Known Issues
 
-**Last updated**: 2026-03-26
+**Last updated**: 2026-03-28
 **Test baseline**: 313 unit + 761 integration = 1,074 passing, 0 ignored, 0 failing
 
 > CLI issues 18–21, Production Reliability issues 22–27, Testing issues 28–30, and Driver issues 33–35 resolved (see sections below). Issues 31–32 require external tools; issues 14 (Triggers) remains open.
@@ -61,6 +61,20 @@ All previously listed critical issues have been resolved.
 ---
 
 ## Production Reliability / Security
+
+### Remaining Open
+
+| # | Issue |
+|---|-------|
+| 36 | **TLS not enforced — server starts in plaintext mode when `--tls-cert`/`--tls-key` are omitted** |
+
+**Details (issue 36):** `crates/server/src/main.rs` treats missing TLS flags as a silent opt-out and continues accepting plaintext TCP connections. The TLS infrastructure is fully implemented (`crates/network/src/tls.rs`, `Server::with_tls()`) but is not required. A client can connect with `sslmode=disable` and the server will accept it.
+
+**Fix required:** In `main.rs`, change the `_ =>` branch of the TLS flag match from logging a warning to returning a hard error, forcing operators to supply a certificate before the server will accept connections. Optionally also reject PostgreSQL `SSLRequest` messages that negotiate plaintext at the protocol level (reply `N` then close the connection instead of continuing).
+
+**Workaround:** Always start the server with `--tls-cert` and `--tls-key` (see README — [Running the server with TLS](#running-the-server-with-tls)). Clients should connect with `sslmode=require` or `sslmode=verify-full`.
+
+---
 
 ### Already Resolved (discovered during audit)
 

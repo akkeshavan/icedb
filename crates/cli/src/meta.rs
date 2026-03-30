@@ -162,7 +162,7 @@ pub fn execute_meta_command(
     }
 }
 
-const HELP_TEXT: &str = r#"General
+pub const HELP_TEXT: &str = r#"General
   \q             quit isql
   \?             show this help
 

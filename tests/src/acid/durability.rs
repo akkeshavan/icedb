@@ -1,5 +1,6 @@
 use tempfile::TempDir;
 use crate::common::*;
+use crate::common::{exec_engine as exec, exec_err_engine as exec_err, query_int_engine as query_int, count_rows_engine as count_rows, exec_session_engine as exec_session, exec_session_err_engine as exec_session_err};
 
 /// Committed data must survive engine restart (simulated by dropping and reopening).
 #[test]

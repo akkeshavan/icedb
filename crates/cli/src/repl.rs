@@ -1,8 +1,11 @@
 use crate::completer::SqlCompleter;
 use crate::config::Config;
 use crate::error::CliError;
-use crate::formatter::{format_command_result, format_expanded, format_table};
-use crate::meta::{execute_meta_command, parse_meta_command};
+use crate::formatter::{
+    format_command_result, format_expanded, format_pg_table, format_table,
+};
+use crate::meta::{execute_meta_command, parse_meta_command, MetaCommand};
+use crate::pg_client::PgClient;
 use catalog::manager::CatalogManager;
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
@@ -10,49 +13,96 @@ use sql::db_manager::DatabaseManager;
 use sql::engine::QueryEngine;
 use std::sync::Arc;
 
+// ── Backend ───────────────────────────────────────────────────────────────────
+
+/// Dispatch target for SQL execution and meta-commands.
+pub enum Backend {
+    /// Engine is embedded in this process — no TCP involved.
+    Embedded {
+        db_manager: Arc<DatabaseManager>,
+        engine: Arc<QueryEngine>,
+        catalog: Arc<CatalogManager>,
+    },
+    /// Engine is running in a separate process; we talk to it over TCP using
+    /// the PostgreSQL wire protocol (Simple Query sub-protocol).
+    Network(PgClient),
+}
+
+// ── REPL ──────────────────────────────────────────────────────────────────────
+
 pub struct Repl {
-    db_manager: Arc<DatabaseManager>,
-    engine: Arc<QueryEngine>,
-    catalog: Arc<CatalogManager>,
+    backend: Backend,
     config: Config,
     current_db: String,
 }
 
 impl Repl {
-    pub fn new(db_manager: Arc<DatabaseManager>, engine: Arc<QueryEngine>, catalog: Arc<CatalogManager>, config: Config) -> Self {
+    /// Construct a REPL backed by the embedded engine.
+    pub fn new_embedded(
+        db_manager: Arc<DatabaseManager>,
+        engine: Arc<QueryEngine>,
+        catalog: Arc<CatalogManager>,
+        config: Config,
+    ) -> Self {
         let current_db = config.dbname.clone();
         let mut repl = Self {
-            db_manager,
-            engine,
-            catalog,
+            backend: Backend::Embedded {
+                db_manager,
+                engine,
+                catalog,
+            },
             config,
             current_db,
         };
-        // If --dbname names a database other than "icedb", switch to it now so
-        // that the initial engine/catalog point at the correct database.
+        // Switch to the requested database if it isn't the default.
         if repl.current_db != "icedb" {
-            if let Ok(new_engine) = repl.db_manager.get_or_open(&repl.current_db) {
-                repl.catalog = Arc::clone(&new_engine.catalog);
-                repl.engine = new_engine;
+            let db_name = repl.current_db.clone();
+            if let Backend::Embedded {
+                ref db_manager,
+                ref mut engine,
+                ref mut catalog,
+            } = repl.backend
+            {
+                if let Ok(new_engine) = db_manager.get_or_open(&db_name) {
+                    *catalog = Arc::clone(&new_engine.catalog);
+                    *engine = new_engine;
+                }
             }
         }
         repl
     }
 
+    /// Construct a REPL backed by a TCP connection to a running server.
+    pub fn new_network(client: PgClient, config: Config) -> Self {
+        let current_db = client.current_db.clone();
+        Self {
+            backend: Backend::Network(client),
+            config,
+            current_db,
+        }
+    }
+
+    // ── Run loop ──────────────────────────────────────────────────────────────
+
     pub fn run(&mut self) -> Result<(), CliError> {
         let mut rl = Editor::<SqlCompleter, rustyline::history::DefaultHistory>::new()
             .map_err(|e| CliError::Readline(e.to_string()))?;
 
-        // Set up completer with known table names
         let table_names = self.get_table_names();
         rl.set_helper(Some(SqlCompleter { table_names }));
 
-        // Load history
         if let Some(ref history_file) = self.config.history_file {
             let _ = rl.load_history(history_file);
         }
 
-        println!("isql (icedb {})", env!("CARGO_PKG_VERSION"));
+        let mode_label = match &self.backend {
+            Backend::Network(_) => format!(
+                " (server {}:{})",
+                self.config.host, self.config.port
+            ),
+            Backend::Embedded { .. } => " (embedded)".to_string(),
+        };
+        println!("isql (icedb {}){}", env!("CARGO_PKG_VERSION"), mode_label);
         println!("Type \"help\" for help, \"\\q\" to quit.\n");
 
         let mut timing = false;
@@ -84,59 +134,44 @@ impl Repl {
             };
 
             let trimmed = line.trim();
-
             if trimmed.is_empty() {
                 continue;
             }
-
-            // Skip pure SQL comment lines (same behaviour as psql).
-            // A line that is entirely a comment contributes nothing to the
-            // statement being built; accumulating it would combine it with
-            // the next token (e.g. "-- remark\nBEGIN") which defeats the
-            // keyword matching in execute_session.
             if trimmed.starts_with("--") {
                 continue;
             }
 
-            // Meta-commands
+            // ── Meta-commands ─────────────────────────────────────────────────
             if trimmed.starts_with('\\') {
                 let _ = rl.add_history_entry(trimmed);
                 match parse_meta_command(trimmed) {
                     Ok(cmd) => {
-                        // Warn when there is pending SQL in the buffer so the
-                        // user knows their statement hasn't executed yet.
-                        if !sql_buffer.is_empty() && !matches!(cmd, crate::meta::MetaCommand::ResetBuffer) {
-                            eprintln!("WARNING: query buffer is not empty (forgot a semicolon?).");
+                        if !sql_buffer.is_empty()
+                            && !matches!(cmd, MetaCommand::ResetBuffer)
+                        {
+                            eprintln!(
+                                "WARNING: query buffer is not empty (forgot a semicolon?)."
+                            );
                             eprintln!("         Use \\r to discard the pending input.");
                         }
-                        match execute_meta_command(
-                            cmd,
-                            &self.catalog,
-                            &self.engine,
-                            &mut timing,
-                            &mut expanded,
-                            self.db_manager.data_dir(),
-                        ) {
+                        match self.execute_meta(cmd, &mut timing, &mut expanded) {
                             Ok(output) => {
                                 if output == "\\q" {
                                     break;
                                 }
-                                // Handle \r — reset query buffer
                                 if output == "\\r" {
                                     sql_buffer.clear();
                                     println!("Query buffer reset.");
                                     continue;
                                 }
-                                // Handle \c dbname — switch database
+                                // \c dbname — switch database
                                 if let Some(db_name) = output.strip_prefix("\\c ") {
                                     let db_name = db_name.trim().to_string();
-                                    match self.db_manager.get_or_open(&db_name) {
-                                        Ok(new_engine) => {
-                                            self.catalog = Arc::clone(&new_engine.catalog);
-                                            self.engine = new_engine;
-                                            self.current_db = db_name.clone();
-                                            println!("You are now connected to database \"{}\".", db_name);
-                                        }
+                                    match self.switch_db(&db_name) {
+                                        Ok(()) => println!(
+                                            "You are now connected to database \"{}\".",
+                                            db_name
+                                        ),
                                         Err(e) => eprintln!("ERROR: {}", e),
                                     }
                                     continue;
@@ -151,13 +186,12 @@ impl Repl {
                 continue;
             }
 
-            // Accumulate SQL
+            // ── SQL accumulation and execution ────────────────────────────────
             if !sql_buffer.is_empty() {
                 sql_buffer.push('\n');
             }
             sql_buffer.push_str(trimmed);
 
-            // Execute when the buffer ends with a semicolon
             if sql_buffer.trim_end().ends_with(';') {
                 let full_input = sql_buffer.trim().to_string();
                 sql_buffer.clear();
@@ -166,22 +200,18 @@ impl Repl {
                     continue;
                 }
 
-                // Split on ';' so that a pasted block of multiple statements
-                // (e.g. three CREATE TABLE statements separated by semicolons)
-                // each produces its own output line.
-                let stmts = split_statements(&full_input);
-                for stmt in &stmts {
+                for stmt in split_statements(&full_input) {
                     if stmt.is_empty() {
                         continue;
                     }
                     let _ = rl.add_history_entry(stmt.as_str());
-                    let output = self.execute_sql(stmt, timing, expanded);
+                    let output = self.execute_sql(&stmt, timing, expanded);
                     print!("{}", output);
                 }
             }
         }
 
-        // Save history and restrict permissions to owner-only (0600)
+        // Save history with 0600 permissions
         if let Some(ref history_file) = self.config.history_file {
             let _ = rl.save_history(history_file);
             #[cfg(unix)]
@@ -197,48 +227,204 @@ impl Repl {
         Ok(())
     }
 
-    fn execute_sql(&self, sql: &str, timing: bool, expanded: bool) -> String {
-        // Strip a trailing semicolon that may remain after splitting
+    // ── SQL execution ─────────────────────────────────────────────────────────
+
+    fn execute_sql(&mut self, sql: &str, timing: bool, expanded: bool) -> String {
         let sql = sql.trim().trim_end_matches(';').trim();
         let start = std::time::Instant::now();
-        // Use execute_session so that BEGIN/COMMIT/ROLLBACK are handled
-        // statelessly across successive calls (the "repl" session ID persists
-        // for the lifetime of this process).
-        match self.engine.execute_session("repl", sql) {
-            Ok(result) => {
-                let mut output = String::new();
-                if !result.rows.is_empty() {
-                    if expanded {
-                        output.push_str(&format_expanded(&result.rows));
+
+        let output = match &mut self.backend {
+            Backend::Embedded { engine, .. } => match engine.execute_session("repl", sql) {
+                Ok(result) => {
+                    if !result.rows.is_empty() {
+                        if expanded {
+                            format_expanded(&result.rows)
+                        } else {
+                            format_table(&result.rows)
+                        }
                     } else {
-                        output.push_str(&format_table(&result.rows));
+                        format_command_result(&result.command, result.rows_affected)
                     }
-                } else {
-                    output.push_str(&format_command_result(
-                        &result.command,
-                        result.rows_affected,
-                    ));
                 }
-                if timing {
-                    output.push_str(&format!(
-                        "Time: {:.3} ms\n",
-                        start.elapsed().as_secs_f64() * 1000.0
-                    ));
+                Err(e) => format!("ERROR: {}\n", e),
+            },
+            Backend::Network(client) => match client.query(sql) {
+                Ok(result) => {
+                    if !result.columns.is_empty() {
+                        format_pg_table(&result.columns, &result.rows, expanded)
+                    } else {
+                        format!("{}\n", result.command_tag)
+                    }
                 }
-                output
-            }
-            Err(e) => format!("ERROR: {}\n", e),
+                Err(e) => format!("ERROR: {}\n", e),
+            },
+        };
+
+        if timing {
+            format!(
+                "{}Time: {:.3} ms\n",
+                output,
+                start.elapsed().as_secs_f64() * 1000.0
+            )
+        } else {
+            output
         }
     }
 
+    // ── Meta-command dispatch ─────────────────────────────────────────────────
+
+    fn execute_meta(
+        &mut self,
+        cmd: MetaCommand,
+        timing: &mut bool,
+        expanded: &mut bool,
+    ) -> Result<String, CliError> {
+        match &mut self.backend {
+            Backend::Embedded {
+                db_manager,
+                engine,
+                catalog,
+            } => execute_meta_command(
+                cmd,
+                catalog,
+                engine,
+                timing,
+                expanded,
+                db_manager.data_dir(),
+            ),
+            Backend::Network(client) => {
+                execute_meta_network(cmd, client, timing, expanded)
+            }
+        }
+    }
+
+    // ── Database switching ────────────────────────────────────────────────────
+
+    fn switch_db(&mut self, db_name: &str) -> Result<(), CliError> {
+        match &mut self.backend {
+            Backend::Embedded {
+                db_manager,
+                engine,
+                catalog,
+            } => {
+                let new_engine = db_manager
+                    .get_or_open(db_name)
+                    .map_err(|e| CliError::Network(e.to_string()))?;
+                *catalog = Arc::clone(&new_engine.catalog);
+                *engine = new_engine;
+                self.current_db = db_name.to_string();
+                Ok(())
+            }
+            Backend::Network(client) => {
+                let new_client = client.reconnect_db(db_name)?;
+                *client = new_client;
+                self.current_db = db_name.to_string();
+                Ok(())
+            }
+        }
+    }
+
+    // ── Table-name list for autocomplete ─────────────────────────────────────
+
     fn get_table_names(&self) -> Vec<String> {
-        // Try to list tables for completion; ignore errors
-        self.catalog.list_tables("public").unwrap_or_default()
+        match &self.backend {
+            Backend::Embedded { catalog, .. } => {
+                catalog.list_tables("public").unwrap_or_default()
+            }
+            Backend::Network(_) => Vec::new(), // populated lazily after connect
+        }
     }
 }
 
+// ── Network meta-command execution ───────────────────────────────────────────
+
+/// Handle meta-commands when the REPL is in network mode.
+///
+/// Commands that require catalog access (`\dt`, `\du`, `\l`, `\d`) are
+/// translated into SQL queries sent to the server.  Commands that are
+/// client-side state (`\timing`, `\x`, `\q`, etc.) are handled locally.
+fn execute_meta_network(
+    cmd: MetaCommand,
+    client: &mut PgClient,
+    timing: &mut bool,
+    expanded: &mut bool,
+) -> Result<String, CliError> {
+    match cmd {
+        MetaCommand::Quit => Ok("\\q".to_string()),
+        MetaCommand::ResetBuffer => Ok("\\r".to_string()),
+        MetaCommand::Help => Ok(crate::meta::HELP_TEXT.to_string()),
+        MetaCommand::Timing => {
+            *timing = !*timing;
+            Ok(format!("Timing is {}.\n", if *timing { "on" } else { "off" }))
+        }
+        MetaCommand::ExpandedOutput => {
+            *expanded = !*expanded;
+            Ok(format!(
+                "Expanded display is {}.\n",
+                if *expanded { "on" } else { "off" }
+            ))
+        }
+        MetaCommand::Connect(db) => {
+            // Return the sentinel; Repl::run handles the actual reconnection
+            // via switch_db so we don't need a double-mutable-borrow here.
+            Ok(format!("\\c {}", db))
+        }
+        MetaCommand::ListTables => {
+            let sql = "SELECT schemaname AS schema, tablename AS name, 'table' AS type \
+                       FROM pg_catalog.pg_tables \
+                       WHERE schemaname NOT IN ('pg_catalog', 'information_schema') \
+                       ORDER BY tablename";
+            match client.query(sql) {
+                Ok(r) if r.columns.is_empty() && r.rows.is_empty() => {
+                    Ok("Did not find any relations.\n".to_string())
+                }
+                Ok(r) => Ok(format_pg_table(&r.columns, &r.rows, false)),
+                Err(e) => Err(e),
+            }
+        }
+        MetaCommand::ListRoles => {
+            let sql = "SELECT rolname, \
+                              CASE WHEN rolsuper THEN 'Superuser' ELSE '' END AS superuser, \
+                              CASE WHEN rolcreatedb THEN 'Create DB' ELSE '' END AS createdb, \
+                              CASE WHEN rolcreaterole THEN 'Create role' ELSE '' END AS createrole \
+                       FROM pg_catalog.pg_roles \
+                       ORDER BY rolname";
+            match client.query(sql) {
+                Ok(r) => Ok(format_pg_table(&r.columns, &r.rows, false)),
+                Err(e) => Err(e),
+            }
+        }
+        MetaCommand::ListDatabases => {
+            let sql = "SELECT datname AS name FROM pg_catalog.pg_database ORDER BY datname";
+            match client.query(sql) {
+                Ok(r) => Ok(format_pg_table(&r.columns, &r.rows, false)),
+                Err(e) => Err(e),
+            }
+        }
+        MetaCommand::Describe(table_name) => {
+            let safe_name = table_name.replace('\'', "''");
+            let sql = format!(
+                "SELECT column_name, data_type, is_nullable \
+                 FROM information_schema.columns \
+                 WHERE table_name = '{}' AND table_schema = 'public' \
+                 ORDER BY ordinal_position",
+                safe_name
+            );
+            match client.query(&sql) {
+                Ok(r) if r.rows.is_empty() => Ok(format!(
+                    "Did not find any relation named \"{}\".\n",
+                    table_name
+                )),
+                Ok(r) => Ok(format_pg_table(&r.columns, &r.rows, false)),
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
+// ── Statement splitter ────────────────────────────────────────────────────────
+
 /// Split a SQL string on `;`, respecting single-quoted strings.
-/// Returns non-empty trimmed statements.
 fn split_statements(sql: &str) -> Vec<String> {
     let mut stmts = Vec::new();
     let mut current = String::new();
@@ -247,11 +433,8 @@ fn split_statements(sql: &str) -> Vec<String> {
 
     while let Some(ch) = chars.next() {
         match ch {
-            // Line comment: skip from '--' to end of line.
-            // Must be checked before the general '-' arm and only outside quotes,
-            // so that apostrophes inside comments don't corrupt quote tracking.
             '-' if !in_quote && chars.peek() == Some(&'-') => {
-                chars.next(); // consume the second '-'
+                chars.next();
                 for c in chars.by_ref() {
                     if c == '\n' {
                         break;

@@ -2,6 +2,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use txn::transaction::IsolationLevel;
 use crate::common::*;
+use crate::common::{exec_engine as exec, exec_err_engine as exec_err, query_int_engine as query_int, count_rows_engine as count_rows, exec_session_engine as exec_session, exec_session_err_engine as exec_session_err};
 
 /// Helper: setup standard Hermitage test table
 fn setup(engine: &Arc<sql::engine::QueryEngine>) {

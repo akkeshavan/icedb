@@ -3,7 +3,7 @@
 /// Ported from PostgreSQL transactions.sql regression suite.
 use tempfile::TempDir;
 use txn::transaction::IsolationLevel;
-use crate::common::{make_engine, exec, query_int, count_rows, exec_session, exec_session_err};
+use crate::common::{make_engine, exec_engine as exec, query_int_engine as query_int, count_rows_engine as count_rows, exec_session_engine as exec_session, exec_session_err_engine as exec_session_err};
 use sql::Value;
 
 // ── Helper ────────────────────────────────────────────────────────────────────

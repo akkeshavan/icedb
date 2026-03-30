@@ -15,6 +15,7 @@ icedb implements the full PostgreSQL wire protocol (v3.0), ACID transactions via
   - [Linux](#linux)
   - [Windows](#windows)
 - [Running the server](#running-the-server)
+  - [Running the server with TLS](#running-the-server-with-tls)
 - [Connecting with the built-in CLI](#connecting-with-the-built-in-cli)
 - [Connecting with psql](#connecting-with-psql)
 - [Admin UI](#admin-ui)
@@ -250,6 +251,168 @@ On first startup icedb bootstraps the system catalogs (`pg_class`, `pg_attribute
 | `--data-dir` | required | Directory for WAL segments, heap files, and indexes |
 | `--host` | `0.0.0.0` | Bind address |
 | `--max-connections` | `128` | Maximum simultaneous client connections |
+| `--shared-buffers` | `1024` | Buffer pool size in 8 kB frames |
+| `--tls-cert` | none | Path to a PEM-encoded X.509 server certificate (enables TLS) |
+| `--tls-key` | none | Path to a PEM-encoded PKCS#8 private key (required when `--tls-cert` is set) |
+
+Both `--tls-cert` and `--tls-key` must be supplied together. If either is omitted, the server starts without TLS and logs a warning. See [Running the server with TLS](#running-the-server-with-tls).
+
+---
+
+### Running the server with TLS
+
+TLS encrypts all traffic between clients and the server. It is optional today (see [known issues #36](./known_issues.md)) but strongly recommended for any deployment beyond a local development machine.
+
+#### Step 1 — Generate a certificate
+
+**Self-signed certificate (development / testing)**
+
+Use OpenSSL to create a certificate that is valid for 365 days:
+
+```sh
+openssl req -x509 \
+  -newkey rsa:4096 \
+  -keyout server.key \
+  -out server.crt \
+  -days 365 \
+  -nodes \
+  -subj "/CN=localhost"
+```
+
+This writes two files into the current directory:
+
+| File | Contents |
+|------|---------|
+| `server.crt` | PEM-encoded X.509 certificate (public) |
+| `server.key` | PEM-encoded PKCS#8 private key (keep this secret) |
+
+Restrict permissions on the key file:
+
+```sh
+chmod 600 server.key
+```
+
+**Production certificate**
+
+For a production deployment, obtain a certificate from a trusted Certificate Authority (CA) such as Let's Encrypt, DigiCert, or your internal PKI. The certificate file must be PEM-encoded and may include intermediate certificates chained after the server certificate. The key file must be PKCS#8 PEM format.
+
+---
+
+#### Step 2 — Start the server with TLS
+
+```sh
+./target/release/icedb-server \
+  --port 5432 \
+  --data-dir ./data \
+  --tls-cert ./server.crt \
+  --tls-key  ./server.key
+```
+
+The server log confirms TLS is active:
+
+```
+INFO  TLS enabled (cert: ./server.crt)
+INFO  icedb listening on 0.0.0.0:5432
+```
+
+If either flag is missing the log will instead say:
+
+```
+INFO  TLS disabled (no --tls-cert/--tls-key)
+```
+
+and the server accepts plaintext connections — do not use this in production.
+
+---
+
+#### Step 3 — Connect over TLS
+
+**icedb CLI (`isql`) — recommended**
+
+`isql` has a built-in network client mode. When `--host` is given it connects to a running server over TCP with optional TLS rather than opening the embedded engine.
+
+```sh
+# TLS with a self-signed cert (skips certificate verification)
+isql --host localhost --port 5432 --user icedb --sslmode require
+
+# TLS with certificate verification against a CA file
+isql --host localhost --port 5432 --user icedb \
+     --sslmode verify-full --sslrootcert ./ca.crt
+```
+
+You will see the server address in the prompt banner:
+
+```
+isql (icedb 0.1.0) (server localhost:5432)
+Type "help" for help, "\q" to quit.
+
+icedb=#
+```
+
+All meta-commands (`\dt`, `\du`, `\l`, `\d tablename`, `\c`, `\timing`, `\x`, `\q`) work the same as in embedded mode.  Table-listing commands (`\dt`, `\du`, `\l`) are translated to SQL queries against `pg_catalog` and `information_schema` on the server.
+
+**`psql` (standard PostgreSQL client)**
+
+Any standard PostgreSQL client also works since icedb speaks the wire protocol:
+
+```sh
+psql "host=localhost port=5432 user=icedb sslmode=require"
+```
+
+For a CA-signed certificate:
+
+```sh
+psql "host=localhost port=5432 user=icedb sslmode=verify-full sslrootcert=./ca.crt"
+```
+
+**Connection string (ORMs, drivers, DBeaver, pgAdmin)**
+
+```
+postgresql://icedb@localhost:5432/icedb?sslmode=require
+```
+
+With certificate verification:
+
+```
+postgresql://icedb@localhost:5432/icedb?sslmode=verify-full&sslrootcert=/path/to/ca.crt
+```
+
+**icedb Rust driver**
+
+```rust
+let conn = icedb::connect("postgresql://icedb@localhost:5432/icedb?sslmode=require")?;
+```
+
+**icedb Python driver**
+
+```python
+import icedb
+conn = icedb.connect(host="localhost", port=5432, user="icedb", sslmode="require")
+```
+
+**icedb Node.js driver**
+
+```js
+const icedb = require("@icedb/driver");
+const conn = icedb.connect({ host: "localhost", port: 5432, user: "icedb", sslmode: "require" });
+```
+
+---
+
+#### `sslmode` reference
+
+| `sslmode` value | Encrypts | Verifies server cert | When to use |
+|----------------|----------|---------------------|-------------|
+| `disable` | No | No | Local development only (not recommended) |
+| `allow` | Maybe | No | Never use |
+| `prefer` | If available | No | Not recommended |
+| `require` | Yes | No | Development with a self-signed cert |
+| `verify-ca` | Yes | Yes (CA chain) | Production with a known CA |
+| `verify-full` | Yes | Yes (CA + hostname) | Production (recommended) |
+
+> **isql `sslmode` mapping**: `disable` → no TLS; `allow`/`prefer`/`require` → encrypt without cert verification; `verify-ca`/`verify-full` → encrypt and verify against `--sslrootcert`.
+
+---
 
 ### Running in the background (Linux / macOS)
 
@@ -361,30 +524,65 @@ cargo test -p sql
 cargo test -p txn -- mvcc_visibility --nocapture
 ```
 
-### Integration tests
+### Integration tests — three modes
 
-The integration tests live in `tests/`, which is a separate Cargo workspace:
+The integration tests live in `tests/`, a separate Cargo workspace. Every test runs in **three modes** automatically:
+
+| Mode | Description |
+|------|-------------|
+| **Embedded** | SQL dispatched directly through an in-process `QueryEngine` — no TCP, no server process |
+| **Plain TCP** | A real `icedb-server` subprocess is started on a free port; `PgClient` connects over plaintext PostgreSQL wire protocol |
+| **TLS** | Same as plain TCP but with `sslmode=require` and a self-signed certificate generated via `openssl` |
 
 ```sh
-cd tests
-cargo test
+# Run all integration tests (all three modes)
+cargo test --manifest-path tests/Cargo.toml
 
-# Single module
-cargo test sql_conformance::joins
+# Single module (runs embedded + plain TCP + TLS variants)
+cargo test --manifest-path tests/Cargo.toml sql_conformance::joins
+
+# Embedded-only (fastest — no server startup overhead)
+cargo test --manifest-path tests/Cargo.toml -- --skip _net
+
+# Network variants only
+cargo test --manifest-path tests/Cargo.toml -- _net
+
+# Skip TLS (useful when openssl is unavailable)
+cargo test --manifest-path tests/Cargo.toml -- --skip _net_tls
 
 # With output
-cargo test -- --nocapture
+cargo test --manifest-path tests/Cargo.toml -- --nocapture
+```
+
+### Chapter 3 sandbox — three modes
+
+`sandbox/ch03` is a standalone Cargo workspace that runs every SQL example from the icedb-book chapter 3 quick-start guide in all three modes:
+
+```sh
+# Run all three ch03 modes as cargo tests
+cargo test --manifest-path sandbox/ch03/Cargo.toml
+
+# Or run the sandbox as a binary (prints a formatted pass/fail/skip table)
+cargo run --manifest-path sandbox/ch03/Cargo.toml
 ```
 
 ### Full sweep
 
 ```sh
 # From the repo root
-cargo test --workspace          # 253 unit tests
-cd tests && cargo test          # 715 integration tests
+cargo test --workspace                                    # 313 unit tests
+cargo test --manifest-path tests/Cargo.toml              # 2204 integration tests (3 modes)
+cargo test --manifest-path sandbox/ch03/Cargo.toml       # 3 ch03 tests (3 modes)
 ```
 
-Total: **968 tests**, 4 ignored, 0 failures.
+Total: **2520 tests**, 6 ignored, 0 failures.
+
+> **Note:** Plain TCP and TLS network tests start a real `icedb-server` process on a free port.
+> Build the server binary first if you haven't already:
+> ```sh
+> cargo build -p server
+> ```
+> TLS tests require `openssl` on `PATH`. Skip them with `--skip _net_tls` if unavailable.
 
 ### Lint and format
 
@@ -511,3 +709,36 @@ VITE_API_URL=http://localhost:8080
 ```
 
 Then restart `npm run dev`.
+
+### TLS: `SSL connection has been closed unexpectedly`
+
+The server is running without TLS but the client is requiring it (or vice versa). Check that:
+
+1. The server was started with both `--tls-cert` and `--tls-key`.
+2. The server log says `TLS enabled` — if it says `TLS disabled` the server is in plaintext mode.
+3. The client connection string includes `sslmode=require` (or another TLS-enabling mode).
+
+### TLS: `certificate verify failed` or `SSL certificate problem`
+
+You are connecting with `sslmode=verify-full` or `sslmode=verify-ca` to a server using a self-signed certificate. Either:
+
+- Switch to `sslmode=require` for development (skips CA verification):
+  ```sh
+  isql --host localhost --user icedb --sslmode require
+  # or with psql:
+  psql "host=localhost port=5432 user=icedb sslmode=require"
+  ```
+- Or pass the self-signed cert as the trusted root:
+  ```sh
+  isql --host localhost --user icedb --sslmode verify-full --sslrootcert ./server.crt
+  # or with psql:
+  psql "host=localhost port=5432 user=icedb sslmode=verify-ca sslrootcert=./server.crt"
+  ```
+
+### TLS: `no private key found in key file`
+
+The key file must be in PKCS#8 PEM format. If you generated an RSA key with an older OpenSSL command, convert it:
+
+```sh
+openssl pkcs8 -topk8 -nocrypt -in server-rsa.key -out server.key
+```

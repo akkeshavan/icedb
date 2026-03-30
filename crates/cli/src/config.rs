@@ -1,3 +1,31 @@
+#[derive(Debug, Clone, PartialEq)]
+pub enum SslMode {
+    Disable,
+    /// Encrypt but do not verify the server certificate.
+    Require,
+    /// Encrypt and verify the certificate against `sslrootcert`.
+    VerifyFull,
+}
+
+impl Default for SslMode {
+    fn default() -> Self {
+        SslMode::Disable
+    }
+}
+
+impl std::str::FromStr for SslMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "disable" => Ok(SslMode::Disable),
+            "allow" | "prefer" | "require" => Ok(SslMode::Require),
+            "verify-ca" | "verify-full" => Ok(SslMode::VerifyFull),
+            other => Err(format!("unknown sslmode: {}", other)),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub data_dir: String,
@@ -7,37 +35,57 @@ pub struct Config {
     pub dbname: String,
     pub password: Option<String>,
     pub history_file: Option<String>,
+    pub sslmode: SslMode,
+    pub sslrootcert: Option<String>,
+    /// True when `--host` was explicitly supplied on the command line or via
+    /// `PGHOST`.  Used by `is_network_mode()` to distinguish an explicit
+    /// remote connection from the defaulted localhost.
+    pub explicit_host: bool,
 }
 
 impl Config {
     pub fn from_args(args: &[String]) -> Self {
-        // Parse: --data-dir, --host/-h, --port/-p, --user/-U, --dbname/-d, --password/-W
-        // Fall back to env vars: PGHOST, PGPORT, PGUSER, PGDATABASE, PGPASSWORD
-        // Defaults: data_dir="./data", host="localhost", port=5432, username="icedb", dbname="icedb"
-        let data_dir = parse_arg(args, "--data-dir").unwrap_or_else(|| "./data".to_string());
-        let host = parse_arg(args, "--host")
-            .or_else(|| parse_arg(args, "-h"))
-            .or_else(|| std::env::var("PGHOST").ok())
-            .unwrap_or_else(|| "localhost".to_string());
+        // `--host` / `PGHOST` set the host AND flag network mode.
+        // `-h` is reserved for `--help` in main.rs and is NOT treated as host
+        // here to avoid the collision.
+        let explicit_host_val = parse_arg(args, "--host")
+            .or_else(|| std::env::var("PGHOST").ok());
+        let explicit_host = explicit_host_val.is_some();
+        let host = explicit_host_val.unwrap_or_else(|| "localhost".to_string());
+
         let port = parse_arg(args, "--port")
             .or_else(|| parse_arg(args, "-p"))
             .or_else(|| std::env::var("PGPORT").ok())
             .and_then(|s| s.parse().ok())
             .unwrap_or(5432u16);
+
         let username = parse_arg(args, "--user")
             .or_else(|| parse_arg(args, "-U"))
             .or_else(|| std::env::var("PGUSER").ok())
             .unwrap_or_else(|| "icedb".to_string());
+
         let dbname = parse_arg(args, "--dbname")
             .or_else(|| parse_arg(args, "-d"))
             .or_else(|| std::env::var("PGDATABASE").ok())
             .unwrap_or_else(|| username.clone());
+
+        let data_dir = parse_arg(args, "--data-dir").unwrap_or_else(|| "./data".to_string());
+
         // Password: explicit flag > PGPASSWORD env var > .pgpass file lookup
         let password = parse_arg(args, "--password")
             .or_else(|| parse_arg(args, "-W"))
             .or_else(|| std::env::var("PGPASSWORD").ok())
             .or_else(|| read_pgpass(&host, port, &dbname, &username));
+
+        let sslmode = parse_arg(args, "--sslmode")
+            .as_deref()
+            .and_then(|s| s.parse::<SslMode>().ok())
+            .unwrap_or_default();
+
+        let sslrootcert = parse_arg(args, "--sslrootcert");
+
         let history_file = dirs_or_home_history_path();
+
         Config {
             data_dir,
             host,
@@ -46,7 +94,16 @@ impl Config {
             dbname,
             password,
             history_file,
+            sslmode,
+            sslrootcert,
+            explicit_host,
         }
+    }
+
+    /// Returns `true` when the CLI should connect to a running server over TCP
+    /// rather than opening the embedded engine from `data_dir`.
+    pub fn is_network_mode(&self) -> bool {
+        self.explicit_host
     }
 }
 
@@ -66,7 +123,6 @@ fn read_pgpass(host: &str, port: u16, dbname: &str, username: &str) -> Option<St
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // Split on unescaped colons (pgpass uses backslash to escape : and \)
         let fields = split_pgpass_line(line);
         if fields.len() < 5 {
             continue;

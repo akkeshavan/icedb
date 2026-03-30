@@ -183,13 +183,33 @@ fn datatype_to_pg_type(dt: &DataType) -> Type {
 
 fn build_field_infos(result: &ExecutionResult) -> Vec<FieldInfo> {
     if let Some(first_row) = result.rows.first() {
-        // Derive types from actual row values
+        // Prefer the declared schema type (dtype) so nullable columns whose first
+        // value is NULL are still reported with the correct OID, not Type::TEXT.
+        // Fall back to the actual value type only when dtype is Text (a sentinel
+        // for "unknown") and the value gives a more specific type.  When the first
+        // row is NULL we scan all rows for the first non-null value so that
+        // expressions like NULLIF(val, 0) (whose first result is NULL) still get
+        // the correct column OID.
         first_row
             .schema
             .iter()
             .enumerate()
-            .map(|(i, (col_name, _dtype))| {
-                let pg_type = first_row.values.get(i).map(value_to_pg_type).unwrap_or(Type::TEXT);
+            .map(|(i, (col_name, dtype))| {
+                let pg_type = if *dtype != DataType::Text && *dtype != DataType::VarChar(0) {
+                    datatype_to_pg_type(dtype)
+                } else {
+                    // Scan all rows for the first non-null value to determine type
+                    let first_non_null = result.rows.iter().find_map(|row| {
+                        row.values.get(i).and_then(|v| match v {
+                            Value::Null => None,
+                            v => Some(v),
+                        })
+                    });
+                    match first_non_null {
+                        Some(v) => value_to_pg_type(v),
+                        None => Type::TEXT,
+                    }
+                };
                 FieldInfo::new(col_name.clone(), None, None, pg_type, FieldFormat::Text)
             })
             .collect()

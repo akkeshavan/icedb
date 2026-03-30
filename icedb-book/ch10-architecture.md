@@ -560,3 +560,71 @@ Startup
 The recovery is **redo-only**. There is no undo phase. Uncommitted transactions are invisible because their XIDs are not in the committed set — MVCC visibility rules exclude them without any physical undo of their writes.
 
 This is correct because every data page modification is logged as a complete `PageImage` record (the full 8 kB page after the modification). Replaying the record to the heap file exactly reconstructs the state at the time of the write, including the MVCC header fields (`t_xmin`, `t_xmax`). Visibility rules then filter out uncommitted tuples correctly.
+
+---
+
+## Testing Architecture
+
+icedb has 2520 automated tests spread across three independent test workspaces. The most important structural property is that every integration test runs in **three modes**.
+
+### Three-mode test execution
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  test_foo_body(b: &Backend)                                      │
+│  ┌───────────────────────────────────────────────────────────┐   │
+│  │  exec(b, "CREATE TABLE t (id INT)")                       │   │
+│  │  exec(b, "INSERT INTO t VALUES (1)")                      │   │
+│  │  assert_eq!(count_rows(b, "SELECT * FROM t"), 1)          │   │
+│  └─────────────────────┬─────────────────────────────────────┘   │
+└────────────────────────┼─────────────────────────────────────────┘
+                         │ crate::net_tests!(test_foo)
+              ┌──────────┼──────────┐
+              ▼          ▼          ▼
+        test_foo    test_foo_net  test_foo_net_tls
+        Embedded    Plain TCP     TLS (sslmode=require)
+        (direct     (icedb-server (icedb-server
+        Rust call)   subprocess)   subprocess + TLS)
+```
+
+The `Backend` enum abstracts over the two transport layers:
+
+```rust
+enum Backend {
+    Embedded(Arc<QueryEngine>),   // direct Rust method call
+    Network(Mutex<PgClient>),     // PostgreSQL wire protocol v3.0
+}
+```
+
+When a test uses `Backend::Network`, SQL is serialized into a `Q` (Simple Query) message, sent over TCP (optionally TLS), and the response is parsed from `RowDescription` + `DataRow` + `CommandComplete` messages. Column types are reconstructed from the PostgreSQL OIDs in `RowDescription`, and errors are mapped from SQLSTATE codes to the same `SqlError` variants the embedded engine produces.
+
+### Test workspaces
+
+| Workspace | Command | Tests | Modes |
+|-----------|---------|-------|-------|
+| Root crates | `cargo test --workspace` | 313 unit | embedded only |
+| `tests/` | `cargo test --manifest-path tests/Cargo.toml` | 2204 integration | embedded + plain TCP + TLS |
+| `sandbox/ch03/` | `cargo test --manifest-path sandbox/ch03/Cargo.toml` | 3 ch03 | embedded + plain TCP + TLS |
+
+### Network test infrastructure
+
+Two long-lived `icedb-server` subprocesses are started once per test-binary invocation via `OnceLock<NetServer>` — one plain TCP, one TLS. Each network test connects to its own isolated database (named after the test function and provisioned with `DROP DATABASE IF EXISTS` + `CREATE DATABASE` before the test body runs). The `#[serial]` attribute from the `serial_test` crate sequences network tests within each server's slot while allowing full parallelism between embedded tests and between the two server instances.
+
+Server processes redirect `stdout`/`stderr` to `Stdio::null()` so they do not inherit the test binary's output pipe, which would otherwise prevent `cargo test | tail -N` style invocations from terminating.
+
+### What the three modes cover
+
+| Concern | Embedded | Plain TCP | TLS |
+|---------|----------|-----------|-----|
+| SQL correctness | ✓ | ✓ | ✓ |
+| Wire protocol framing | — | ✓ | ✓ |
+| Type OID encoding/decoding | — | ✓ | ✓ |
+| SQLSTATE error propagation | — | ✓ | ✓ |
+| TLS handshake and encryption | — | — | ✓ |
+| Concurrent session isolation | ✓ | ✓ | ✓ |
+| Catalog introspection APIs | ✓ | — | — |
+| Dump/restore internals | ✓ | — | — |
+
+Tests that use internal Rust APIs not accessible over the wire (dump/restore, catalog listener, vacuum tracking) run embedded-only via `if b.is_network() { return; }` guards.
+
+Full details are in [`tests/TEST-ARCHITECTURE.md`](../tests/TEST-ARCHITECTURE.md).

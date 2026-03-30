@@ -1,17 +1,14 @@
 /// Tests for Array and JSON/JSONB types.
 use tempfile::TempDir;
-use crate::common::{make_engine, exec, count_rows, query_int};
+use crate::common::{make_engine, exec, count_rows, query_int, Backend};
 use sql::Value;
 
 // ── Array type tests ───────────────────────────────────────────────────────────
 
-#[test]
-fn test_array_create_and_insert() {
-    let dir = TempDir::new().unwrap();
-    let engine = make_engine(dir.path());
-    exec(&engine, "CREATE TABLE tags (id INT, labels TEXT[])");
-    exec(&engine, "INSERT INTO tags VALUES (1, ARRAY['foo','bar','baz'])");
-    let result = exec(&engine, "SELECT labels FROM tags WHERE id = 1");
+fn test_array_create_and_insert_body(b: &crate::common::Backend) {
+    exec(b, "CREATE TABLE tags (id INT, labels TEXT[])");
+    exec(b, "INSERT INTO tags VALUES (1, ARRAY['foo','bar','baz'])");
+    let result = exec(b, "SELECT labels FROM tags WHERE id = 1");
     assert_eq!(result.rows.len(), 1);
     match result.rows[0].get_by_idx(0) {
         Some(Value::Array(v)) => {
@@ -25,12 +22,19 @@ fn test_array_create_and_insert() {
 }
 
 #[test]
-fn test_array_length() {
-    let dir = TempDir::new().unwrap();
-    let engine = make_engine(dir.path());
-    exec(&engine, "CREATE TABLE tags (id INT, labels TEXT[])");
-    exec(&engine, "INSERT INTO tags VALUES (1, ARRAY['foo','bar','baz'])");
-    let result = exec(&engine, "SELECT array_length(labels, 1) FROM tags WHERE id = 1");
+fn test_array_create_and_insert() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let b = crate::common::Backend::embedded(dir.path());
+    test_array_create_and_insert_body(&b);
+}
+
+crate::net_tests!(test_array_create_and_insert);
+
+
+fn test_array_length_body(b: &crate::common::Backend) {
+    exec(b, "CREATE TABLE tags (id INT, labels TEXT[])");
+    exec(b, "INSERT INTO tags VALUES (1, ARRAY['foo','bar','baz'])");
+    let result = exec(b, "SELECT array_length(labels, 1) FROM tags WHERE id = 1");
     assert_eq!(result.rows.len(), 1);
     match result.rows[0].get_by_idx(0) {
         Some(Value::Int4(3)) => {}
@@ -39,12 +43,19 @@ fn test_array_length() {
 }
 
 #[test]
-fn test_array_subscript() {
-    let dir = TempDir::new().unwrap();
-    let engine = make_engine(dir.path());
-    exec(&engine, "CREATE TABLE tags (id INT, labels TEXT[])");
-    exec(&engine, "INSERT INTO tags VALUES (1, ARRAY['foo','bar','baz'])");
-    let result = exec(&engine, "SELECT labels[1] FROM tags WHERE id = 1");
+fn test_array_length() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let b = crate::common::Backend::embedded(dir.path());
+    test_array_length_body(&b);
+}
+
+crate::net_tests!(test_array_length);
+
+
+fn test_array_subscript_body(b: &crate::common::Backend) {
+    exec(b, "CREATE TABLE tags (id INT, labels TEXT[])");
+    exec(b, "INSERT INTO tags VALUES (1, ARRAY['foo','bar','baz'])");
+    let result = exec(b, "SELECT labels[1] FROM tags WHERE id = 1");
     assert_eq!(result.rows.len(), 1);
     match result.rows[0].get_by_idx(0) {
         Some(Value::Text(s)) => assert_eq!(s, "foo"),
@@ -53,12 +64,19 @@ fn test_array_subscript() {
 }
 
 #[test]
-fn test_array_to_string() {
-    let dir = TempDir::new().unwrap();
-    let engine = make_engine(dir.path());
-    exec(&engine, "CREATE TABLE tags (id INT, labels TEXT[])");
-    exec(&engine, "INSERT INTO tags VALUES (1, ARRAY['foo','bar','baz'])");
-    let result = exec(&engine, "SELECT array_to_string(labels, ',') FROM tags WHERE id = 1");
+fn test_array_subscript() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let b = crate::common::Backend::embedded(dir.path());
+    test_array_subscript_body(&b);
+}
+
+crate::net_tests!(test_array_subscript);
+
+
+fn test_array_to_string_body(b: &crate::common::Backend) {
+    exec(b, "CREATE TABLE tags (id INT, labels TEXT[])");
+    exec(b, "INSERT INTO tags VALUES (1, ARRAY['foo','bar','baz'])");
+    let result = exec(b, "SELECT array_to_string(labels, ',') FROM tags WHERE id = 1");
     assert_eq!(result.rows.len(), 1);
     match result.rows[0].get_by_idx(0) {
         Some(Value::Text(s)) => assert_eq!(s, "foo,bar,baz"),
@@ -67,12 +85,19 @@ fn test_array_to_string() {
 }
 
 #[test]
-fn test_array_agg() {
-    let dir = TempDir::new().unwrap();
-    let engine = make_engine(dir.path());
-    exec(&engine, "CREATE TABLE nums (v INT)");
-    exec(&engine, "INSERT INTO nums VALUES (1), (2), (3)");
-    let result = exec(&engine, "SELECT array_agg(v) FROM nums");
+fn test_array_to_string() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let b = crate::common::Backend::embedded(dir.path());
+    test_array_to_string_body(&b);
+}
+
+crate::net_tests!(test_array_to_string);
+
+
+fn test_array_agg_body(b: &crate::common::Backend) {
+    exec(b, "CREATE TABLE nums (v INT)");
+    exec(b, "INSERT INTO nums VALUES (1), (2), (3)");
+    let result = exec(b, "SELECT array_agg(v) FROM nums");
     assert_eq!(result.rows.len(), 1);
     match result.rows[0].get_by_idx(0) {
         Some(Value::Array(v)) => {
@@ -83,12 +108,19 @@ fn test_array_agg() {
 }
 
 #[test]
-fn test_array_int() {
-    let dir = TempDir::new().unwrap();
-    let engine = make_engine(dir.path());
-    exec(&engine, "CREATE TABLE arr_test (id INT, vals INT[])");
-    exec(&engine, "INSERT INTO arr_test VALUES (1, ARRAY[10, 20, 30])");
-    let result = exec(&engine, "SELECT array_length(vals, 1) FROM arr_test WHERE id = 1");
+fn test_array_agg() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let b = crate::common::Backend::embedded(dir.path());
+    test_array_agg_body(&b);
+}
+
+crate::net_tests!(test_array_agg);
+
+
+fn test_array_int_body(b: &crate::common::Backend) {
+    exec(b, "CREATE TABLE arr_test (id INT, vals INT[])");
+    exec(b, "INSERT INTO arr_test VALUES (1, ARRAY[10, 20, 30])");
+    let result = exec(b, "SELECT array_length(vals, 1) FROM arr_test WHERE id = 1");
     assert_eq!(result.rows.len(), 1);
     match result.rows[0].get_by_idx(0) {
         Some(Value::Int4(3)) => {}
@@ -97,13 +129,20 @@ fn test_array_int() {
 }
 
 #[test]
-fn test_array_persistence() {
-    let dir = TempDir::new().unwrap();
-    let engine = make_engine(dir.path());
-    exec(&engine, "CREATE TABLE tags (id INT, labels TEXT[])");
-    exec(&engine, "INSERT INTO tags VALUES (1, ARRAY['foo','bar'])");
-    exec(&engine, "INSERT INTO tags VALUES (2, ARRAY['baz'])");
-    let result = exec(&engine, "SELECT id, array_length(labels, 1) FROM tags ORDER BY id");
+fn test_array_int() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let b = crate::common::Backend::embedded(dir.path());
+    test_array_int_body(&b);
+}
+
+crate::net_tests!(test_array_int);
+
+
+fn test_array_persistence_body(b: &crate::common::Backend) {
+    exec(b, "CREATE TABLE tags (id INT, labels TEXT[])");
+    exec(b, "INSERT INTO tags VALUES (1, ARRAY['foo','bar'])");
+    exec(b, "INSERT INTO tags VALUES (2, ARRAY['baz'])");
+    let result = exec(b, "SELECT id, array_length(labels, 1) FROM tags ORDER BY id");
     assert_eq!(result.rows.len(), 2);
     match result.rows[0].get_by_idx(1) {
         Some(Value::Int4(2)) => {}
@@ -115,15 +154,22 @@ fn test_array_persistence() {
     }
 }
 
+#[test]
+fn test_array_persistence() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let b = crate::common::Backend::embedded(dir.path());
+    test_array_persistence_body(&b);
+}
+
+crate::net_tests!(test_array_persistence);
+
+
 // ── JSON type tests ────────────────────────────────────────────────────────────
 
-#[test]
-fn test_json_create_and_insert() {
-    let dir = TempDir::new().unwrap();
-    let engine = make_engine(dir.path());
-    exec(&engine, "CREATE TABLE docs (id INT, data JSON)");
-    exec(&engine, "INSERT INTO docs VALUES (1, '{\"name\":\"Alice\",\"age\":30}')");
-    let result = exec(&engine, "SELECT data FROM docs WHERE id = 1");
+fn test_json_create_and_insert_body(b: &crate::common::Backend) {
+    exec(b, "CREATE TABLE docs (id INT, data JSON)");
+    exec(b, "INSERT INTO docs VALUES (1, '{\"name\":\"Alice\",\"age\":30}')");
+    let result = exec(b, "SELECT data FROM docs WHERE id = 1");
     assert_eq!(result.rows.len(), 1);
     match result.rows[0].get_by_idx(0) {
         Some(Value::Json(s)) => {
@@ -134,12 +180,40 @@ fn test_json_create_and_insert() {
 }
 
 #[test]
+fn test_json_create_and_insert() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let b = crate::common::Backend::embedded(dir.path());
+    test_json_create_and_insert_body(&b);
+}
+
+crate::net_tests!(test_json_create_and_insert);
+
+
+fn test_json_arrow_operator_body(b: &crate::common::Backend) {
+    exec(b, "CREATE TABLE docs (id INT, data JSON)");
+    exec(b, "INSERT INTO docs VALUES (1, '{\"name\":\"Alice\",\"age\":30}')");
+    let result = exec(b, "SELECT data->>'name' FROM docs WHERE id = 1");
+    assert_eq!(result.rows.len(), 1);
+    match result.rows[0].get_by_idx(0) {
+        Some(Value::Text(s)) => assert_eq!(s, "Alice"),
+        other => panic!("expected 'Alice', got {:?}", other),
+    }
+}
+
+#[test]
 fn test_json_arrow_operator() {
-    let dir = TempDir::new().unwrap();
-    let engine = make_engine(dir.path());
-    exec(&engine, "CREATE TABLE docs (id INT, data JSON)");
-    exec(&engine, "INSERT INTO docs VALUES (1, '{\"name\":\"Alice\",\"age\":30}')");
-    let result = exec(&engine, "SELECT data->>'name' FROM docs WHERE id = 1");
+    let dir = tempfile::TempDir::new().unwrap();
+    let b = crate::common::Backend::embedded(dir.path());
+    test_json_arrow_operator_body(&b);
+}
+
+crate::net_tests!(test_json_arrow_operator);
+
+
+fn test_json_extract_path_text_body(b: &crate::common::Backend) {
+    exec(b, "CREATE TABLE docs (id INT, data JSON)");
+    exec(b, "INSERT INTO docs VALUES (1, '{\"name\":\"Alice\",\"age\":30}')");
+    let result = exec(b, "SELECT json_extract_path_text(data, 'name') FROM docs WHERE id = 1");
     assert_eq!(result.rows.len(), 1);
     match result.rows[0].get_by_idx(0) {
         Some(Value::Text(s)) => assert_eq!(s, "Alice"),
@@ -149,25 +223,18 @@ fn test_json_arrow_operator() {
 
 #[test]
 fn test_json_extract_path_text() {
-    let dir = TempDir::new().unwrap();
-    let engine = make_engine(dir.path());
-    exec(&engine, "CREATE TABLE docs (id INT, data JSON)");
-    exec(&engine, "INSERT INTO docs VALUES (1, '{\"name\":\"Alice\",\"age\":30}')");
-    let result = exec(&engine, "SELECT json_extract_path_text(data, 'name') FROM docs WHERE id = 1");
-    assert_eq!(result.rows.len(), 1);
-    match result.rows[0].get_by_idx(0) {
-        Some(Value::Text(s)) => assert_eq!(s, "Alice"),
-        other => panic!("expected 'Alice', got {:?}", other),
-    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let b = crate::common::Backend::embedded(dir.path());
+    test_json_extract_path_text_body(&b);
 }
 
-#[test]
-fn test_json_typeof() {
-    let dir = TempDir::new().unwrap();
-    let engine = make_engine(dir.path());
-    exec(&engine, "CREATE TABLE docs (id INT, data JSON)");
-    exec(&engine, "INSERT INTO docs VALUES (1, '{\"name\":\"Alice\",\"age\":30}')");
-    let result = exec(&engine, "SELECT json_typeof(data) FROM docs WHERE id = 1");
+crate::net_tests!(test_json_extract_path_text);
+
+
+fn test_json_typeof_body(b: &crate::common::Backend) {
+    exec(b, "CREATE TABLE docs (id INT, data JSON)");
+    exec(b, "INSERT INTO docs VALUES (1, '{\"name\":\"Alice\",\"age\":30}')");
+    let result = exec(b, "SELECT json_typeof(data) FROM docs WHERE id = 1");
     assert_eq!(result.rows.len(), 1);
     match result.rows[0].get_by_idx(0) {
         Some(Value::Text(s)) => assert_eq!(s, "object"),
@@ -176,12 +243,19 @@ fn test_json_typeof() {
 }
 
 #[test]
-fn test_jsonb_type() {
-    let dir = TempDir::new().unwrap();
-    let engine = make_engine(dir.path());
-    exec(&engine, "CREATE TABLE docs (id INT, data JSONB)");
-    exec(&engine, "INSERT INTO docs VALUES (1, '{\"x\":1}')");
-    let result = exec(&engine, "SELECT data->>'x' FROM docs WHERE id = 1");
+fn test_json_typeof() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let b = crate::common::Backend::embedded(dir.path());
+    test_json_typeof_body(&b);
+}
+
+crate::net_tests!(test_json_typeof);
+
+
+fn test_jsonb_type_body(b: &crate::common::Backend) {
+    exec(b, "CREATE TABLE docs (id INT, data JSONB)");
+    exec(b, "INSERT INTO docs VALUES (1, '{\"x\":1}')");
+    let result = exec(b, "SELECT data->>'x' FROM docs WHERE id = 1");
     assert_eq!(result.rows.len(), 1);
     match result.rows[0].get_by_idx(0) {
         Some(Value::Text(s)) => assert_eq!(s, "1"),
@@ -190,10 +264,17 @@ fn test_jsonb_type() {
 }
 
 #[test]
-fn test_json_build_object() {
-    let dir = TempDir::new().unwrap();
-    let engine = make_engine(dir.path());
-    let result = exec(&engine, "SELECT json_build_object('name', 'Bob', 'age', 25)");
+fn test_jsonb_type() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let b = crate::common::Backend::embedded(dir.path());
+    test_jsonb_type_body(&b);
+}
+
+crate::net_tests!(test_jsonb_type);
+
+
+fn test_json_build_object_body(b: &crate::common::Backend) {
+    let result = exec(b, "SELECT json_build_object('name', 'Bob', 'age', 25)");
     assert_eq!(result.rows.len(), 1);
     match result.rows[0].get_by_idx(0) {
         Some(Value::Json(s)) => {
@@ -205,13 +286,20 @@ fn test_json_build_object() {
 }
 
 #[test]
-fn test_json_persistence() {
-    let dir = TempDir::new().unwrap();
-    let engine = make_engine(dir.path());
-    exec(&engine, "CREATE TABLE docs (id INT, data JSON)");
-    exec(&engine, "INSERT INTO docs VALUES (1, '{\"name\":\"Alice\"}')");
-    exec(&engine, "INSERT INTO docs VALUES (2, '{\"name\":\"Bob\"}')");
-    let result = exec(&engine, "SELECT data->>'name' FROM docs ORDER BY id");
+fn test_json_build_object() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let b = crate::common::Backend::embedded(dir.path());
+    test_json_build_object_body(&b);
+}
+
+crate::net_tests!(test_json_build_object);
+
+
+fn test_json_persistence_body(b: &crate::common::Backend) {
+    exec(b, "CREATE TABLE docs (id INT, data JSON)");
+    exec(b, "INSERT INTO docs VALUES (1, '{\"name\":\"Alice\"}')");
+    exec(b, "INSERT INTO docs VALUES (2, '{\"name\":\"Bob\"}')");
+    let result = exec(b, "SELECT data->>'name' FROM docs ORDER BY id");
     assert_eq!(result.rows.len(), 2);
     match result.rows[0].get_by_idx(0) {
         Some(Value::Text(s)) => assert_eq!(s, "Alice"),
@@ -222,3 +310,13 @@ fn test_json_persistence() {
         other => panic!("expected 'Bob', got {:?}", other),
     }
 }
+
+#[test]
+fn test_json_persistence() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let b = crate::common::Backend::embedded(dir.path());
+    test_json_persistence_body(&b);
+}
+
+crate::net_tests!(test_json_persistence);
+

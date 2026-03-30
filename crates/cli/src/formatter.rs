@@ -97,3 +97,65 @@ pub fn format_expanded(rows: &[Row]) -> String {
 pub fn format_command_result(command: &str, _rows_affected: u64) -> String {
     format!("{}\n", command)
 }
+
+/// Format a result set received over the network (raw string columns/rows).
+///
+/// Used by the TCP client mode where values arrive as text rather than typed
+/// [`Value`] variants.
+pub fn format_pg_table(
+    columns: &[String],
+    rows: &[Vec<Option<String>>],
+    expanded: bool,
+) -> String {
+    if columns.is_empty() {
+        return "(0 rows)\n".to_string();
+    }
+
+    if expanded {
+        return format_pg_expanded(columns, rows);
+    }
+
+    if rows.is_empty() {
+        return "(0 rows)\n".to_string();
+    }
+
+    use tabled::builder::Builder;
+
+    let mut builder = Builder::default();
+    builder.push_record(columns.iter().map(String::as_str).collect::<Vec<_>>());
+
+    for row in rows {
+        let cells: Vec<String> = row
+            .iter()
+            .map(|v| v.as_deref().unwrap_or("NULL").to_string())
+            .collect();
+        builder.push_record(cells.iter().map(String::as_str).collect::<Vec<_>>());
+    }
+
+    let mut table = builder.build();
+    table.with(Style::psql());
+
+    let n = rows.len();
+    format!("{}\n({} {})\n", table, n, if n == 1 { "row" } else { "rows" })
+}
+
+fn format_pg_expanded(columns: &[String], rows: &[Vec<Option<String>>]) -> String {
+    if rows.is_empty() {
+        return "(0 rows)\n".to_string();
+    }
+
+    let max_w = columns.iter().map(|c| c.len()).max().unwrap_or(0);
+    let mut out = String::new();
+
+    for (i, row) in rows.iter().enumerate() {
+        out.push_str(&format!("-[ RECORD {} ]\n", i + 1));
+        for (col, val) in columns.iter().zip(row.iter()) {
+            let v = val.as_deref().unwrap_or("NULL");
+            out.push_str(&format!("{:<width$} | {}\n", col, v, width = max_w));
+        }
+    }
+
+    let n = rows.len();
+    out.push_str(&format!("({} {})\n", n, if n == 1 { "row" } else { "rows" }));
+    out
+}

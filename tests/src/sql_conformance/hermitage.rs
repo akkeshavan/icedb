@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use tempfile::TempDir;
 use txn::transaction::IsolationLevel;
-use crate::common::{make_engine, exec, query_int};
+use crate::common::{make_engine, exec_engine as exec, query_int_engine as query_int};
 use sql::Value;
 
 /// Helper: get integer value from transaction context.

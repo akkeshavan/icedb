@@ -3,6 +3,7 @@ pub mod config;
 pub mod error;
 pub mod formatter;
 pub mod meta;
+pub mod pg_client;
 pub mod repl;
 
 pub use config::Config;

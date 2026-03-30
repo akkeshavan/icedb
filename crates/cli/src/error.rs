@@ -10,4 +10,6 @@ pub enum CliError {
     Readline(String),
     #[error("Unknown meta-command: {0}")]
     UnknownMetaCommand(String),
+    #[error("Network error: {0}")]
+    Network(String),
 }
